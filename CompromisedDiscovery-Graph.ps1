@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "7.1"
+$ScriptVer = "7.2"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -1039,11 +1039,82 @@ function Connect-TenantServices {
         # Log the audit status
         Write-Log "Admin audit log status: $($auditStatus.Status) - $($auditStatus.Message)" -Level "Info"
         
-        # Show success message with tenant info and audit status
+# NEW: Also connect to Exchange Online silently
+        Update-GuiStatus "Preparing Exchange Online connection..." ([System.Drawing.Color]::Orange)
+        Write-Log "Preparing Exchange Online connection after Graph connection" -Level "Info"
+        
+        # Clean up any existing Exchange Online connections first
+        $existingSessions = Get-PSSession | Where-Object { 
+            $_.ConfigurationName -eq "Microsoft.Exchange" 
+        }
+        
+        if ($existingSessions) {
+            Update-GuiStatus "Cleaning up existing Exchange Online sessions..." ([System.Drawing.Color]::Orange)
+            Write-Log "Found $($existingSessions.Count) existing Exchange Online session(s), cleaning up..." -Level "Info"
+            
+            try {
+                Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+            }
+            catch {
+                # Force remove sessions if disconnect fails
+                $existingSessions | Remove-PSSession -ErrorAction SilentlyContinue
+            }
+        }
+        
+        Update-GuiStatus "Connecting to Exchange Online..." ([System.Drawing.Color]::Orange)
+        
+        try {
+            # Check if Exchange Online module is available
+            if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
+                Update-GuiStatus "Installing Exchange Online module..." ([System.Drawing.Color]::Orange)
+                Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Write-Log "Exchange Online module installed successfully" -Level "Info"
+            }
+            
+            # Import the module
+            if (-not (Get-Module -Name ExchangeOnlineManagement)) {
+                Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
+                Write-Log "Exchange Online module imported" -Level "Info"
+            }
+            
+            # Connect to Exchange Online using the same authentication context
+            Connect-ExchangeOnline -ShowProgress $false -ShowBanner:$false -ErrorAction Stop
+            
+            # Test connection
+            $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
+            if ($testResult) {
+                Write-Log "Exchange Online connection successful and verified" -Level "Info"
+                Update-GuiStatus "Connected to both Microsoft Graph and Exchange Online" ([System.Drawing.Color]::Green)
+                
+                # Initialize Exchange Online state tracking
+                $Global:ExchangeOnlineState = @{
+                    IsConnected = $true
+                    LastChecked = Get-Date
+                    ConnectionAttempts = 0
+                }
+            }
+        }
+        catch {
+            Write-Log "Exchange Online connection failed (non-fatal): $($_.Exception.Message)" -Level "Warning"
+            Update-GuiStatus "Graph connected, Exchange Online connection failed - will retry during inbox rules collection" ([System.Drawing.Color]::Orange)
+            
+            # Initialize Exchange Online state as failed
+            $Global:ExchangeOnlineState = @{
+                IsConnected = $false
+                LastChecked = Get-Date
+                ConnectionAttempts = 1
+            }
+        }
+        
+        # Show success message with both connection statuses
+        $exoStatus = if ($Global:ExchangeOnlineState.IsConnected) { "Connected" } else { "Failed (will retry)" }
+        
         $successMessage = "Successfully connected to Microsoft Graph!`n`n" +
                          "Tenant: $($organization.DisplayName)`n" +
                          "Account: $($context.Account)`n" +
                          "Working Directory: $newWorkDir`n`n" +
+                         "Microsoft Graph: Connected`n" +
+                         "Exchange Online: $exoStatus`n`n" +
                          "Admin Audit Status: $($auditStatus.Status)"
         
         [System.Windows.Forms.MessageBox]::Show($successMessage, "Connection Successful", "OK", "Information")
@@ -1867,19 +1938,76 @@ function Get-MessageTraceExchangeOnline {
     Update-GuiStatus "Starting Exchange Online message trace collection using Get-MessageTraceV2..." ([System.Drawing.Color]::Orange)
     
     try {
-        # Check Exchange Online connection
-        $existingSession = Get-PSSession | Where-Object { $_.ConfigurationName -eq "Microsoft.Exchange" -and $_.State -eq "Opened" }
+        # Clean up any existing Exchange Online connections first
+        Update-GuiStatus "Checking for existing Exchange Online connections..." ([System.Drawing.Color]::Orange)
         
-        if (-not $existingSession) {
-            Update-GuiStatus "Connecting to Exchange Online..." ([System.Drawing.Color]::Orange)
+        $existingSessions = Get-PSSession | Where-Object { 
+            $_.ConfigurationName -eq "Microsoft.Exchange" 
+        }
+        
+        if ($existingSessions) {
+            Update-GuiStatus "Disconnecting existing Exchange Online sessions..." ([System.Drawing.Color]::Orange)
+            Write-Log "Found $($existingSessions.Count) existing Exchange Online session(s), disconnecting..." -Level "Info"
             
-            if (-not (Get-Module -Name ExchangeOnlineManagement)) {
-                Import-Module ExchangeOnlineManagement -Force
+            try {
+                Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
+                Write-Log "Successfully disconnected existing Exchange Online sessions" -Level "Info"
+            }
+            catch {
+                Write-Log "Warning during disconnect: $($_.Exception.Message)" -Level "Warning"
+                # Force remove sessions if disconnect fails
+                $existingSessions | Remove-PSSession -ErrorAction SilentlyContinue
             }
             
-            Connect-ExchangeOnline -ShowProgress $true -ShowBanner:$false
-            Write-Log "Connected to Exchange Online for message trace" -Level "Info"
+            # Reset global state
+            if ($Global:ExchangeOnlineState) {
+                $Global:ExchangeOnlineState.IsConnected = $false
+                $Global:ExchangeOnlineState.LastChecked = Get-Date
+                $Global:ExchangeOnlineState.ConnectionAttempts = 0
+            }
         }
+        
+        # Ensure Exchange Online module is available
+        Update-GuiStatus "Checking Exchange Online PowerShell module..." ([System.Drawing.Color]::Orange)
+        
+        if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
+            Update-GuiStatus "Installing Exchange Online module..." ([System.Drawing.Color]::Orange)
+            Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Write-Log "Exchange Online module installed for message trace" -Level "Info"
+        }
+        
+        if (-not (Get-Module -Name ExchangeOnlineManagement)) {
+            Update-GuiStatus "Loading Exchange Online module..." ([System.Drawing.Color]::Orange)
+            Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
+            Write-Log "Exchange Online module loaded for message trace" -Level "Info"
+        }
+        
+        # Connect to Exchange Online fresh
+        Update-GuiStatus "Connecting to Exchange Online for message trace..." ([System.Drawing.Color]::Orange)
+        Write-Log "Starting fresh Exchange Online connection for message trace" -Level "Info"
+        
+        Connect-ExchangeOnline -ShowProgress $false -ShowBanner:$false -ErrorAction Stop
+        
+        # Verify connection
+        $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
+        if (-not $testResult) {
+            throw "Exchange Online connection verification failed"
+        }
+        
+        Write-Log "Exchange Online connection verified for message trace" -Level "Info"
+        Update-GuiStatus "Exchange Online connected successfully for message trace" ([System.Drawing.Color]::Green)
+        
+        # Update global state
+        if (-not $Global:ExchangeOnlineState) {
+            $Global:ExchangeOnlineState = @{
+                IsConnected = $false
+                LastChecked = $null
+                ConnectionAttempts = 0
+            }
+        }
+        $Global:ExchangeOnlineState.IsConnected = $true
+        $Global:ExchangeOnlineState.LastChecked = Get-Date
+        $Global:ExchangeOnlineState.ConnectionAttempts = 0
         
         # Calculate date range - keep it conservative
         $actualDaysBack = [Math]::Min($DaysBack, 7)
@@ -1889,12 +2017,8 @@ function Get-MessageTraceExchangeOnline {
         Write-Log "Message trace range: $($startDate.ToString('yyyy-MM-dd')) to $($endDate.ToString('yyyy-MM-dd'))" -Level "Info"
         
         if ($DaysBack -gt 7) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Date range adjusted to 7 days (Exchange Online limitation).",
-                "Range Adjusted",
-                "OK",
-                "Information"
-            )
+            Update-GuiStatus "Date range adjusted to 7 days (Exchange Online limitation)" ([System.Drawing.Color]::Orange)
+            Write-Log "Date range adjusted from $DaysBack to 7 days due to Exchange Online limitations" -Level "Warning"
         }
         
         # Use Get-MessageTraceV2 with correct parameters
@@ -1911,7 +2035,7 @@ function Get-MessageTraceExchangeOnline {
         
         if ($allMessages.Count -eq 0) {
             Update-GuiStatus "No messages found in date range" ([System.Drawing.Color]::Orange)
-            [System.Windows.Forms.MessageBox]::Show("No messages found for the specified date range.", "No Data", "OK", "Information")
+            Write-Log "No messages found for the specified date range" -Level "Warning"
             return @()
         }
         
@@ -1952,19 +2076,18 @@ function Get-MessageTraceExchangeOnline {
         Update-GuiStatus "Message trace complete! $($allMessages.Count) messages exported." ([System.Drawing.Color]::Green)
         Write-Log "Message trace completed: $($allMessages.Count) total messages processed with Get-MessageTraceV2" -Level "Info"
         
-        [System.Windows.Forms.MessageBox]::Show(
-            "Message Trace Complete!`n`nTotal: $($allMessages.Count) messages`n`nFile: MessageTraceResult.csv`n`nNote: Get-MessageTraceV2 doesn't provide direction classification",
-            "Success",
-            "OK",
-            "Information"
-        )
-        
         return $etrMessages
         
     } catch {
         Update-GuiStatus "Error: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
         Write-Log "Message trace error: $($_.Exception.Message)" -Level "Error"
-        [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)", "Error", "OK", "Error")
+        
+        # Update global state on error
+        if ($Global:ExchangeOnlineState) {
+            $Global:ExchangeOnlineState.IsConnected = $false
+            $Global:ExchangeOnlineState.LastChecked = Get-Date
+        }
+        
         return $null
     }
 }
@@ -2024,7 +2147,7 @@ function Get-MailboxRules {
             return @()
         }
         
-        # FIXED: Single connection attempt with clear error handling
+        # Check Exchange Online connection - use existing connection if available
         Write-Log "Checking Exchange Online connection for mailbox rules..." -Level "Info"
         
         $connectionResult = Connect-ExchangeOnlineIfNeeded
@@ -2041,10 +2164,10 @@ function Get-MailboxRules {
                 "Warning"
             )
             
-            return @()  # Return empty array instead of null to avoid downstream issues
+            return @()
         }
         
-        # FIXED: Additional verification before proceeding
+        # Additional verification before proceeding
         try {
             # Quick test to ensure we can actually query Exchange Online
             $testMailbox = Get-Mailbox -ResultSize 1 -ErrorAction Stop | Select-Object -First 1
@@ -2210,47 +2333,20 @@ function Get-MailboxRules {
             Write-Log "Statistics: $($allRules.Count) total rules, $($enabledRules.Count) enabled, $($suspiciousRules.Count) suspicious" -Level "Info"
             Write-Log "Processing summary: $successCount successful, $errorCount errors out of $totalMailboxes mailboxes" -Level "Info"
             
-            # Show summary
-            $message = "Exchange Online Mailbox Rules Collection Complete!`n`n" +
-                      "✅ Total Rules Found: $($allRules.Count)`n" +
-                      "⚠️ Suspicious Rules: $($suspiciousRules.Count)`n" +
-                      "📧 Mailboxes with Rules: $usersWithRules`n" +
-                      "✅ Successfully Processed: $successCount/$totalMailboxes mailboxes`n`n" +
-                      "Files created:`n• InboxRules.csv`n" +
-                      $(if ($suspiciousRules.Count -gt 0) { "• InboxRules_Suspicious.csv" } else { "" })
-            
-            [System.Windows.Forms.MessageBox]::Show($message, "Collection Complete", "OK", "Information")
+            # NO MORE POPUP DIALOGS - just log the results
+            Write-Log "Collection results: $($allRules.Count) total rules, $($suspiciousRules.Count) suspicious, $usersWithRules mailboxes with rules" -Level "Info"
         } else {
             Update-GuiStatus "No mailbox rules found via Exchange Online." ([System.Drawing.Color]::Green)
             Write-Log "No mailbox rules found in any mailboxes" -Level "Info"
             Write-Log "Processing summary: $successCount successful, $errorCount errors out of $totalMailboxes mailboxes" -Level "Info"
-            
-            [System.Windows.Forms.MessageBox]::Show(
-                "No inbox rules found in any mailboxes.`n`nThis could mean:`n• No users have created inbox rules`n• All rules were successfully processed`n• This is normal for many organizations",
-                "No Rules Found",
-                "OK",
-                "Information"
-            )
         }
-        
-        # Note: We intentionally DON'T disconnect Exchange Online here
-        # because the user might want to run this multiple times
-        # They can disconnect manually if needed
         
         return $allRules
         
     } catch {
         Update-GuiStatus "Error in Exchange Online mailbox rules collection: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
         Write-Log "Error in Exchange Online mailbox rules collection: $($_.Exception.Message)" -Level "Error"
-        
-        [System.Windows.Forms.MessageBox]::Show(
-            "Error during Exchange Online mailbox rules collection:`n`n$($_.Exception.Message)",
-            "Collection Error",
-            "OK",
-            "Error"
-        )
-        
-        return @()  # Return empty array instead of null to avoid downstream issues
+        return @()
     }
 }
 
