@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "7.2"
+$ScriptVer = "7.4"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -1861,6 +1861,50 @@ function Get-AdminAuditData {
                 default { $riskLevel = "Low" }
             }
             
+            # NEW: Determine LOGIN status
+            $loginStatus = "OTHER"
+            
+            # Check if this is a login-related activity
+            $loginActivities = @(
+                "Sign-in activity",
+                "User logged in",
+                "User signed in",
+                "Interactive user sign in",
+                "Non-interactive user sign in",
+                "Service principal sign in",
+                "Sign in",
+                "Authentication",
+                "Login"
+            )
+            
+            $isLoginActivity = $false
+            foreach ($loginActivity in $loginActivities) {
+                if ($activityDisplayName -like "*$loginActivity*") {
+                    $isLoginActivity = $true
+                    break
+                }
+            }
+            
+            if ($isLoginActivity) {
+                # Determine success/failure based on result
+                switch ($log.result) {
+                    "success" { $loginStatus = "TRUE" }
+                    "failure" { $loginStatus = "FALSE" }
+                    "interrupted" { $loginStatus = "FALSE" }
+                    "timeout" { $loginStatus = "FALSE" }
+                    default { 
+                        # Also check result reason for additional context
+                        if ($log.resultReason -like "*success*" -or $log.resultReason -like "*completed*") {
+                            $loginStatus = "TRUE"
+                        } elseif ($log.resultReason -like "*fail*" -or $log.resultReason -like "*error*" -or $log.resultReason -like "*denied*") {
+                            $loginStatus = "FALSE"
+                        } else {
+                            $loginStatus = "OTHER"
+                        }
+                    }
+                }
+            }
+            
             # Extract target information
             $targetResources = $log.targetResources | ForEach-Object {
                 [PSCustomObject]@{
@@ -1882,8 +1926,9 @@ function Get-AdminAuditData {
                 CorrelationId = $log.correlationId
                 LoggedByService = $log.loggedByService
                 RiskLevel = $riskLevel
+                LOGIN = $loginStatus
                 TargetResources = ($targetResources | ConvertTo-Json -Compress -Depth 10)
-				AdditionalDetails = ($log.additionalDetails | ConvertTo-Json -Compress -Depth 10)
+                AdditionalDetails = ($log.additionalDetails | ConvertTo-Json -Compress -Depth 10)
             }
             
             $processedLogs += $processedLog
@@ -1912,8 +1957,26 @@ function Get-AdminAuditData {
             Write-Log "Found $($failedLogs.Count) failed admin operations" -Level "Warning"
         }
         
+        # NEW: Filter for login activities
+        $loginLogs = $processedLogs | Where-Object { $_.LOGIN -ne "OTHER" }
+        $loginPath = $OutputPath -replace '.csv$', '_LoginActivity.csv'
+        
+        if ($loginLogs.Count -gt 0) {
+            $loginLogs | Export-Csv -Path $loginPath -NoTypeInformation -Force
+            $successfulLogins = ($loginLogs | Where-Object { $_.LOGIN -eq "TRUE" }).Count
+            $failedLogins = ($loginLogs | Where-Object { $_.LOGIN -eq "FALSE" }).Count
+            Write-Log "Found $($loginLogs.Count) login activities: $successfulLogins successful, $failedLogins failed" -Level "Info"
+        }
+        
         Update-GuiStatus "Admin audit log collection completed successfully. Processed $($processedLogs.Count) records." ([System.Drawing.Color]::Green)
         Write-Log "Admin audit log collection completed. Results saved to $OutputPath" -Level "Info"
+        
+        # Log summary of login activities
+        $loginSummary = $processedLogs | Group-Object -Property LOGIN | ForEach-Object {
+            "$($_.Name): $($_.Count)"
+        }
+        Write-Log "LOGIN column summary: $($loginSummary -join ', ')" -Level "Info"
+        
         return $processedLogs
     }
     catch {
@@ -2255,6 +2318,29 @@ function Get-MailboxRules {
                             $suspiciousReasons += "Moves to Deleted Items"
                         }
                         
+                        # NEW: Check for moves/copies to potentially suspicious folders
+                        if ($rule.MoveToFolder -or $rule.CopyToFolder) {
+                            $targetFolder = if ($rule.MoveToFolder) { $rule.MoveToFolder } else { $rule.CopyToFolder }
+                            $actionType = if ($rule.MoveToFolder) { "Moves" } else { "Copies" }
+                            
+                            # Check for suspicious folder destinations
+                            $suspiciousFolders = @("Archive", "Conversation History", "Junk", "RSS Feeds", "Spam", "Clutter")
+                            
+                            foreach ($suspiciousFolder in $suspiciousFolders) {
+                                if ($targetFolder -like "*$suspiciousFolder*") {
+                                    $isSuspicious = $true
+                                    $suspiciousReasons += "$actionType to $suspiciousFolder folder"
+                                    break
+                                }
+                            }
+                            
+                            # Also check for any folder with "junk", "spam", "archive", "conversation" in the name (case insensitive)
+                            if ($targetFolder -match "(?i)(junk|spam|archive|conversation|rss|clutter)") {
+                                $isSuspicious = $true
+                                $suspiciousReasons += "$actionType to potentially hidden folder ($targetFolder)"
+                            }
+                        }
+                        
                         # Check for stopping rule processing
                         if ($rule.StopProcessingRules -eq $true) {
                             $suspiciousReasons += "Stops processing other rules"
@@ -2349,7 +2435,6 @@ function Get-MailboxRules {
         return @()
     }
 }
-
 # Optional: Add a function to manually disconnect Exchange Online
 function Disconnect-ExchangeOnlineSafely {
     try {
