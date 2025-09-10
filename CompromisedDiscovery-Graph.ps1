@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "7.4"
+$ScriptVer = "7.8"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -478,6 +478,367 @@ function Update-ConnectionStatus {
     }
 }
 
+function Test-SecurityDefaults {
+    <#
+    .SYNOPSIS
+    Checks if Microsoft 365 Security Defaults are enabled
+    .DESCRIPTION
+    Tests whether security defaults are enabled, which can block sign-in log access via Graph API
+    #>
+    
+    try {
+        Update-GuiStatus "Checking security defaults configuration..." ([System.Drawing.Color]::Orange)
+        Write-Log "Testing security defaults status..." -Level "Info"
+        
+        # Try to get the security defaults policy
+        $securityDefaultsUri = "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy"
+        $securityDefaultsPolicy = Invoke-MgGraphRequest -Uri $securityDefaultsUri -Method GET -ErrorAction Stop
+        
+        $isEnabled = $securityDefaultsPolicy.isEnabled -eq $true
+        
+        if ($isEnabled) {
+            Write-Log "Security defaults are ENABLED - this may block sign-in log access" -Level "Warning"
+            Update-GuiStatus "Security defaults detected as ENABLED" ([System.Drawing.Color]::Orange)
+        } else {
+            Write-Log "Security defaults are disabled" -Level "Info"
+            Update-GuiStatus "Security defaults are disabled" ([System.Drawing.Color]::Green)
+        }
+        
+        return @{
+            IsEnabled = $isEnabled
+            PolicyId = $securityDefaultsPolicy.id
+            DisplayName = $securityDefaultsPolicy.displayName
+            Description = $securityDefaultsPolicy.description
+        }
+    }
+    catch {
+        Write-Log "Could not determine security defaults status: $($_.Exception.Message)" -Level "Warning"
+        Update-GuiStatus "Could not check security defaults status" ([System.Drawing.Color]::Orange)
+        
+        return @{
+            IsEnabled = $null
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-SignInDataFromExchangeOnline {
+    param (
+        [Parameter(Mandatory = $false)]
+        [int]$DaysBack = $ConfigData.DateRange,
+        
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData_EXO.csv")
+    )
+    
+    Update-GuiStatus "Collecting sign-in data via Exchange Online (Security Defaults fallback)..." ([System.Drawing.Color]::Orange)
+    Write-Log "Using Exchange Online fallback for sign-in data collection" -Level "Info"
+    
+    try {
+        # Ensure Exchange Online connection
+        $connectionResult = Connect-ExchangeOnlineIfNeeded
+        if (-not $connectionResult) {
+            throw "Exchange Online connection failed - cannot collect sign-in data"
+        }
+        
+        # Calculate date range - use the full requested range
+        $startDate = (Get-Date).AddDays(-$DaysBack)
+        $endDate = Get-Date
+        $totalDays = [Math]::Ceiling(($endDate - $startDate).TotalDays)
+        
+        Write-Log "EXO Sign-in data range: $($startDate.ToString('yyyy-MM-dd')) to $($endDate.ToString('yyyy-MM-dd')) ($totalDays days)" -Level "Info"
+        
+        # Determine optimal chunk size based on date range
+        $chunkSizeHours = if ($DaysBack -le 3) { 12 } elseif ($DaysBack -le 7) { 24 } else { 48 }  # 12h, 1day, or 2day chunks
+        $expectedChunks = [Math]::Ceiling(($endDate - $startDate).TotalHours / $chunkSizeHours)
+        
+        Update-GuiStatus "Processing $totalDays days in $expectedChunks chunks ($chunkSizeHours hour chunks)..." ([System.Drawing.Color]::Orange)
+        Write-Log "Using $chunkSizeHours hour chunks, expecting $expectedChunks total chunks" -Level "Info"
+        
+        # Initialize progress tracking
+        $auditLogs = @()
+        $currentStart = $startDate
+        $chunkNumber = 0
+        $totalRecords = 0
+        
+        # Initialize IP cache for geolocation
+        if (-not $Global:IPCache) {
+            $Global:IPCache = @{}
+        }
+        
+        while ($currentStart -lt $endDate) {
+            $chunkNumber++
+            $currentEnd = if ($currentStart.AddHours($chunkSizeHours) -lt $endDate) { $currentStart.AddHours($chunkSizeHours) } else { $endDate }
+            $chunkHours = [Math]::Round(($currentEnd - $currentStart).TotalHours, 1)
+            
+            # Detailed progress update
+            $progressPercent = [Math]::Round(($chunkNumber / $expectedChunks) * 100, 1)
+            Update-GuiStatus "Chunk $chunkNumber/$expectedChunks ($progressPercent%): $($currentStart.ToString('MM/dd HH:mm'))-$($currentEnd.ToString('MM/dd HH:mm')) ($chunkHours hrs)" ([System.Drawing.Color]::Orange)
+            Write-Log "Processing chunk $chunkNumber/$expectedChunks : $($currentStart.ToString('yyyy-MM-dd HH:mm')) to $($currentEnd.ToString('yyyy-MM-dd HH:mm'))" -Level "Info"
+            [System.Windows.Forms.Application]::DoEvents()  # Keep GUI responsive
+            
+            try {
+                # Create query with timeout handling
+                $chunkLogs = @()
+                $timeoutSeconds = if ($chunkSizeHours -le 24) { 90 } else { 120 }  # Longer timeout for larger chunks
+                
+                # Adjust result size based on chunk size
+                $maxResults = if ($chunkSizeHours -le 12) { 2000 } elseif ($chunkSizeHours -le 24) { 3000 } else { 5000 }
+                
+                # Simple progress tracking without jobs
+                $waitStart = Get-Date
+                Update-GuiStatus "Chunk $chunkNumber/$expectedChunks : Querying $chunkHours h timespan..." ([System.Drawing.Color]::Orange)
+                [System.Windows.Forms.Application]::DoEvents()
+                
+                # Instead of using jobs, run the query directly in the current session to maintain Exchange Online connection
+                try {
+                    Write-Log "Querying chunk $chunkNumber/$expectedChunks directly (no job isolation)" -Level "Info"
+                    
+                    # Try specific operations first
+                    $chunkLogs = Search-UnifiedAuditLog -StartDate $currentStart -EndDate $currentEnd -ResultSize $maxResults -Operations "UserLoggedIn","UserLoginFailed","UserLoggedOut" -ErrorAction Stop
+                    if ($chunkLogs.Count -eq 0) {
+                        # Fallback to broader Azure AD activities
+                        Write-Log "No specific sign-in operations found, trying broader search..." -Level "Info"
+                        $chunkLogs = Search-UnifiedAuditLog -StartDate $currentStart -EndDate $currentEnd -ResultSize $maxResults -RecordType "AzureActiveDirectory" -ErrorAction Stop
+                    }
+                    
+                    $queryTime = [Math]::Round(((Get-Date) - $waitStart).TotalSeconds, 1)
+                    Write-Log "Query completed in $queryTime seconds: $($chunkLogs.Count) records" -Level "Info"
+                    Update-GuiStatus "Chunk $chunkNumber/$expectedChunks : Retrieved $($chunkLogs.Count) records in $queryTime seconds" ([System.Drawing.Color]::Green)
+                }
+                catch {
+                    Write-Log "Error querying chunk $chunkNumber : $($_.Exception.Message)" -Level "Warning"
+                    Update-GuiStatus "Chunk $chunkNumber/$expectedChunks : Query failed - $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+                    $chunkLogs = @()
+                }
+                
+                if ($chunkLogs -and $chunkLogs.Count -gt 0) {
+                    $auditLogs += $chunkLogs
+                    $totalRecords += $chunkLogs.Count
+                } 
+                
+            }
+            catch {
+                Write-Log "Error in chunk $chunkNumber : $($_.Exception.Message)" -Level "Warning"
+                Update-GuiStatus "Chunk $chunkNumber/$expectedChunks : Error occurred - continuing" ([System.Drawing.Color]::Orange)
+            }
+            
+            # Update running totals
+            Update-GuiStatus "Progress: $chunkNumber/$expectedChunks chunks completed. Total records: $totalRecords" ([System.Drawing.Color]::Green)
+            [System.Windows.Forms.Application]::DoEvents()
+            
+            $currentStart = $currentEnd
+            
+            # Short delay to avoid throttling, but not too long
+            Start-Sleep -Seconds 1
+        }
+        
+        Write-Log "Completed all $chunkNumber chunks: $totalRecords total audit log entries" -Level "Info"
+        Update-GuiStatus "Query phase complete: $totalRecords audit entries from $chunkNumber chunks" ([System.Drawing.Color]::Green)
+        
+        # Fallback attempt if no data found
+        if ($auditLogs.Count -eq 0) {
+            Update-GuiStatus "No audit logs found - trying simplified recent query..." ([System.Drawing.Color]::Orange)
+            
+            try {
+                $fallbackJob = Start-Job -ScriptBlock {
+                    Search-UnifiedAuditLog -StartDate (Get-Date).AddHours(-48) -EndDate (Get-Date) -ResultSize 1000 -ErrorAction Stop
+                }
+                
+                $fallbackCompleted = Wait-Job -Job $fallbackJob -Timeout 60
+                if ($fallbackCompleted) {
+                    $auditLogs = Receive-Job -Job $fallbackJob
+                    Write-Log "Fallback query returned $($auditLogs.Count) records" -Level "Info"
+                    Update-GuiStatus "Fallback query retrieved $($auditLogs.Count) recent records" ([System.Drawing.Color]::Green)
+                }
+                Remove-Job -Job $fallbackJob -Force
+            }
+            catch {
+                Write-Log "Fallback query failed: $($_.Exception.Message)" -Level "Warning"
+            }
+        }
+        
+        # Processing phase with detailed progress
+        Update-GuiStatus "Starting processing phase: Converting $($auditLogs.Count) audit entries to sign-in records..." ([System.Drawing.Color]::Orange)
+        
+        $signInData = @()
+        $processedCount = 0
+        $geoLookupCount = 0
+        
+        foreach ($auditEntry in $auditLogs) {
+            $processedCount++
+            
+            # Update progress every 100 records
+            if ($processedCount % 100 -eq 0) {
+                $percentage = [math]::Round(($processedCount / $auditLogs.Count) * 100, 1)
+                Update-GuiStatus "Processing entries: $processedCount/$($auditLogs.Count) ($percentage%) - $geoLookupCount geo lookups" ([System.Drawing.Color]::Orange)
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            
+            # Extract IP and location info from audit entry
+            $clientIP = ""
+            $userAgent = ""
+            
+            # Parse AuditData JSON
+            try {
+                if ($auditEntry.AuditData) {
+                    $auditData = $auditEntry.AuditData | ConvertFrom-Json
+                    
+                    # Extract IP address
+                    if ($auditData.ClientIP) {
+                        $clientIP = $auditData.ClientIP
+                    } elseif ($auditData.ActorIpAddress) {
+                        $clientIP = $auditData.ActorIpAddress
+                    } elseif ($auditData.ClientIPAddress) {
+                        $clientIP = $auditData.ClientIPAddress
+                    }
+                    
+                    # Extract user agent
+                    if ($auditData.UserAgent) {
+                        $userAgent = $auditData.UserAgent
+                    } elseif ($auditData.ClientInfo) {
+                        $userAgent = $auditData.ClientInfo
+                    }
+                }
+            }
+            catch {
+                # Continue if JSON parsing fails
+            }
+            
+            # Determine success/failure
+            $isSuccess = $true
+            $status = "0"
+            $failureReason = ""
+            
+            if ($auditEntry.Operation -like "*Failed*" -or $auditEntry.Operation -like "*Fail*") {
+                $isSuccess = $false
+                $status = "50126"
+                $failureReason = "Authentication failed"
+            }
+            
+            # Geolocation with caching
+            $city = "Unknown"
+            $region = "Unknown"
+            $country = "Unknown"
+            $isp = "Unknown"
+            $isUnusualLocation = $false
+            
+            if (-not [string]::IsNullOrEmpty($clientIP) -and $clientIP -ne "127.0.0.1" -and $clientIP -notmatch "^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\.") {
+                if ($Global:IPCache.ContainsKey($clientIP)) {
+                    # Use cached result
+                    $geoResult = $Global:IPCache[$clientIP]
+                } else {
+                    # New IP lookup
+                    try {
+                        $geoResult = Invoke-IPGeolocation -IPAddress $clientIP -Cache @{}
+                        $Global:IPCache[$clientIP] = $geoResult
+                        $geoLookupCount++
+                    }
+                    catch {
+                        $geoResult = $null
+                        $Global:IPCache[$clientIP] = $null
+                    }
+                }
+                
+                if ($geoResult) {
+                    $city = if ($geoResult.city) { $geoResult.city } else { "Unknown" }
+                    $region = if ($geoResult.region_name) { $geoResult.region_name } else { "Unknown" }
+                    $country = if ($geoResult.country_name) { $geoResult.country_name } else { "Unknown" }
+                    $isp = if ($geoResult.connection -and $geoResult.connection.isp) { $geoResult.connection.isp } else { "Unknown" }
+                    $isUnusualLocation = $ConfigData.ExpectedCountries -notcontains $country
+                }
+            }
+            
+            # Create sign-in record
+            $signInRecord = [PSCustomObject]@{
+                UserId = $auditEntry.UserIds
+                UserDisplayName = $auditEntry.UserIds
+                CreationTime = $auditEntry.CreationDate
+                UserAgent = $userAgent
+                IP = $clientIP
+                ISP = $isp
+                City = $city
+                RegionName = $region
+                Country = $country
+                IsUnusualLocation = $isUnusualLocation
+                Status = $status
+                FailureReason = $failureReason
+                ConditionalAccessStatus = "Unknown"
+                RiskLevel = if (-not $isSuccess) { "medium" } else { "none" }
+                DeviceOS = ""
+                DeviceBrowser = ""
+                IsInteractive = $true
+                AppDisplayName = $auditEntry.Workload
+                DataSource = "UnifiedAuditLog"
+            }
+            
+            $signInData += $signInRecord
+        }
+        
+        Update-GuiStatus "Processing complete: $($signInData.Count) sign-in records created. Removing duplicates..." ([System.Drawing.Color]::Orange)
+        
+        # Remove duplicates and export
+        if ($signInData.Count -gt 0) {
+            # Remove duplicates based on user, IP, and time (within 5 minutes)
+            $uniqueSignIns = @()
+            $signInData = $signInData | Sort-Object UserId, CreationTime
+            $duplicateCount = 0
+            
+            foreach ($signIn in $signInData) {
+                $isDuplicate = $false
+                foreach ($existing in $uniqueSignIns) {
+                    if ($existing.UserId -eq $signIn.UserId -and 
+                        $existing.IP -eq $signIn.IP -and
+                        [math]::Abs(([DateTime]$existing.CreationTime - [DateTime]$signIn.CreationTime).TotalMinutes) -lt 5) {
+                        $isDuplicate = $true
+                        $duplicateCount++
+                        break
+                    }
+                }
+                
+                if (-not $isDuplicate) {
+                    $uniqueSignIns += $signIn
+                }
+            }
+            
+            Update-GuiStatus "Removed $duplicateCount duplicates. Exporting $($uniqueSignIns.Count) unique sign-ins..." ([System.Drawing.Color]::Orange)
+            
+            # Export results
+            $uniqueSignIns | Export-Csv -Path $OutputPath -NoTypeInformation -Force
+            
+            # Create filtered reports
+            $unusualSignIns = $uniqueSignIns | Where-Object { $_.IsUnusualLocation -eq $true }
+            if ($unusualSignIns.Count -gt 0) {
+                $unusualOutputPath = $OutputPath -replace '.csv$', '_Unusual.csv'
+                $unusualSignIns | Export-Csv -Path $unusualOutputPath -NoTypeInformation -Force
+                Write-Log "Found $($unusualSignIns.Count) sign-ins from unusual locations" -Level "Warning"
+            }
+            
+            # Final summary
+            $summary = "Exchange Online sign-in collection completed!`n" +
+                      "• Date range: $DaysBack days ($($startDate.ToString('yyyy-MM-dd')) to $($endDate.ToString('yyyy-MM-dd')))`n" +
+                      "• Processed $chunkNumber chunks with $($auditLogs.Count) audit entries`n" +
+                      "• Performed $geoLookupCount new geolocation lookups`n" +
+                      "• Final result: $($uniqueSignIns.Count) unique sign-ins ($duplicateCount duplicates removed)`n" +
+                      "• Unusual locations: $($unusualSignIns.Count)"
+            
+            Update-GuiStatus "SUCCESS: $($uniqueSignIns.Count) unique sign-ins from $DaysBack days processed!" ([System.Drawing.Color]::Green)
+            Write-Log "Exchange Online sign-in data collection completed successfully" -Level "Info"
+            Write-Log $summary.Replace("`n", " | ") -Level "Info"
+            
+            return $uniqueSignIns
+        } else {
+            Update-GuiStatus "No sign-in data found via Exchange Online" ([System.Drawing.Color]::Orange)
+            Write-Log "No sign-in data found in Unified Audit Log" -Level "Warning"
+            return @()
+        }
+    }
+    catch {
+        Update-GuiStatus "Error collecting sign-in data via Exchange Online: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Error in Exchange Online sign-in data collection: $($_.Exception.Message)" -Level "Error"
+        return $null
+    }
+}
 
 function Disconnect-GraphSafely {
     param (
@@ -1332,46 +1693,144 @@ function Get-TenantSignInData {
     
     Update-GuiStatus "Starting optimized sign-in data collection for the past $DaysBack days..." ([System.Drawing.Color]::Orange)
     
+    # ENHANCED: Check security defaults first
+    $securityDefaultsStatus = Test-SecurityDefaults
+    
     # FIXED: Proper ISO 8601 date formatting for Microsoft Graph (UTC format)
     $startDate = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $endDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     
     try {
-        # FIXED: Test permissions first before attempting data collection
-        Update-GuiStatus "Testing sign-in log permissions..." ([System.Drawing.Color]::Orange)
+        # ENHANCED: Test permissions first, but with security defaults awareness
+        Update-GuiStatus "Testing sign-in log access..." ([System.Drawing.Color]::Orange)
         
+        $permissionTestPassed = $false
+        $shouldTryExchangeFallback = $false
+        
+        # If security defaults are enabled, warn user and prepare for fallback
+        if ($securityDefaultsStatus.IsEnabled -eq $true) {
+            Update-GuiStatus "Security defaults enabled - sign-in logs may be restricted" ([System.Drawing.Color]::Orange)
+            
+            $fallbackChoice = [System.Windows.Forms.MessageBox]::Show(
+                "Security Defaults Detected`n`n" +
+                "Microsoft 365 Security Defaults are enabled in this tenant.`n" +
+                "This typically blocks access to sign-in logs via Microsoft Graph API.`n`n" +
+                "Options:`n" +
+                "• Yes: Try Graph API first, use Exchange Online fallback if it fails`n" +
+                "• No: Skip Graph API and use Exchange Online directly`n" +
+                "• Cancel: Skip sign-in data collection`n`n" +
+                "Recommendation: Choose 'No' to save time and use Exchange Online directly.",
+                "Security Defaults - Choose Collection Method",
+                "YesNoCancel",
+                "Warning"
+            )
+            
+            switch ($fallbackChoice) {
+                "Yes" { 
+                    Write-Log "User chose to try Graph API first with Exchange Online fallback" -Level "Info"
+                    $shouldTryExchangeFallback = $true
+                }
+                "No" { 
+                    Write-Log "User chose to skip Graph API and use Exchange Online directly" -Level "Info"
+                    Update-GuiStatus "Using Exchange Online for sign-in data collection..." ([System.Drawing.Color]::Orange)
+                    return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
+                }
+                "Cancel" {
+                    Write-Log "User cancelled sign-in data collection due to security defaults" -Level "Info"
+                    Update-GuiStatus "Sign-in data collection cancelled by user" ([System.Drawing.Color]::Orange)
+                    return $null
+                }
+            }
+        }
+        
+        # Try Graph API permission test
+        $testApproaches = @(
+            @{
+                Name = "Basic signIns endpoint"
+                Uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=1"
+                Headers = @{}
+            },
+            @{
+                Name = "signIns with eventual consistency"
+                Uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=1"
+                Headers = @{'ConsistencyLevel' = 'eventual'}
+            }
+        )
+        
+        foreach ($approach in $testApproaches) {
+            try {
+                Write-Log "Testing approach: $($approach.Name)" -Level "Info"
+                $testResponse = Invoke-MgGraphRequest -Uri $approach.Uri -Method GET -Headers $approach.Headers -ErrorAction Stop
+                Write-Log "✅ Sign-in log access verified with: $($approach.Name)" -Level "Info"
+                $permissionTestPassed = $true
+                break
+            }
+            catch {
+                $errorMessage = $_.Exception.Message
+                Write-Log "✗ Approach '$($approach.Name)' failed: $errorMessage" -Level "Warning"
+                
+                # Check for security defaults specific errors
+                if ($errorMessage -like "*security defaults*" -or $errorMessage -like "*Conditional Access*") {
+                    Write-Log "Security defaults or Conditional Access blocking Graph API access" -Level "Error"
+                    $shouldTryExchangeFallback = $true
+                    break
+                }
+            }
+        }
+        
+        # ENHANCED: Handle fallback logic
+        if (-not $permissionTestPassed) {
+            if ($shouldTryExchangeFallback -or $securityDefaultsStatus.IsEnabled -eq $true) {
+                Write-Log "Graph API failed, attempting Exchange Online fallback" -Level "Warning"
+                Update-GuiStatus "Graph API blocked - switching to Exchange Online fallback..." ([System.Drawing.Color]::Orange)
+                
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Microsoft Graph API Blocked`n`n" +
+                    "Sign-in log access via Graph API failed (likely due to Security Defaults).`n`n" +
+                    "Switching to Exchange Online fallback method.`n" +
+                    "This will collect sign-in information from Exchange audit logs.",
+                    "Using Fallback Method",
+                    "OK",
+                    "Information"
+                )
+                
+                return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
+            } else {
+                Write-Log "All permission test approaches failed and no fallback requested" -Level "Error"
+                
+                $shouldProceed = [System.Windows.Forms.MessageBox]::Show(
+                    "Sign-in Log Access Test Failed`n`n" +
+                    "The permission test failed. This might be due to:`n" +
+                    "• Insufficient permissions`n" +
+                    "• Security defaults blocking access`n" +
+                    "• Tenant configuration restrictions`n`n" +
+                    "Options:`n" +
+                    "• Yes: Try Exchange Online fallback method`n" +
+                    "• No: Skip sign-in data collection",
+                    "Permission Test Failed - Use Fallback?",
+                    "YesNo",
+                    "Warning"
+                )
+                
+                if ($shouldProceed -eq "Yes") {
+                    return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
+                } else {
+                    Update-GuiStatus "Sign-in data collection skipped by user choice" ([System.Drawing.Color]::Orange)
+                    return $null
+                }
+            }
+        }
+        
+        # Continue with original Graph API logic if permission test passed
         try {
-            # Test with a minimal query first to check permissions
-            $testUri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=1"
-            $testResponse = Invoke-MgGraphRequest -Uri $testUri -Method GET -Headers @{'ConsistencyLevel' = 'eventual'} -ErrorAction Stop
-            Write-Log "Sign-in log permissions verified successfully" -Level "Info"
+            $context = Get-MgContext
+            Write-Log "Current Graph context: $($context.Account) with scopes: $($context.Scopes -join ', ')" -Level "Info"
+            Update-GuiStatus "Connected as: $($context.Account)" ([System.Drawing.Color]::Green)
         }
         catch {
-            $errorMessage = $_.Exception.Message
-            Write-Log "Sign-in log permission test failed: $errorMessage" -Level "Error"
-            
-            if ($errorMessage -like "*Forbidden*" -or $errorMessage -like "*Unauthorized*") {
-                $permissionError = "PERMISSION DENIED: Sign-in Logs`n`n" +
-                                 "Your account lacks the required permissions to read sign-in logs.`n`n" +
-                                 "Required Permissions:`n" +
-                                 "• AuditLog.Read.All (Application/Delegated)`n" +
-                                 "• Directory.Read.All (Application/Delegated)`n`n" +
-                                 "Required Admin Roles:`n" +
-                                 "• Global Administrator`n" +
-                                 "• Security Administrator`n" +
-                                 "• Security Reader`n" +
-                                 "• Reports Reader`n`n" +
-                                 "Please ensure your account has these permissions and try again."
-                
-                [System.Windows.Forms.MessageBox]::Show($permissionError, "Permission Error", "OK", "Error")
-                Update-GuiStatus "Sign-in data collection failed - insufficient permissions" ([System.Drawing.Color]::Red)
-                return $null
-            }
-            else {
-                throw # Re-throw if it's not a permission issue
-            }
+            Write-Log "Could not retrieve current Graph context" -Level "Warning"
         }
-        
+              
         # FIXED: Load required assembly for URL encoding
         Add-Type -AssemblyName System.Web
         
@@ -1787,22 +2246,26 @@ function Get-TenantSignInData {
         Update-GuiStatus "Error collecting sign-in data: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
         Write-Log "Error collecting sign-in data: $($_.Exception.Message)" -Level "Error"
         
-        # FIXED: Better error messages for common issues
-        if ($_.Exception.Message -like "*Forbidden*") {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Access Denied: Sign-in Logs`n`n" +
-                "Your account does not have sufficient permissions.`n`n" +
-                "Required: AuditLog.Read.All permission and Security Reader role or higher.",
-                "Permission Error",
-                "OK",
-                "Error"
+        # ENHANCED: Offer Exchange Online fallback on any Graph API error
+        if ($_.Exception.Message -like "*Forbidden*" -or $_.Exception.Message -like "*security defaults*") {
+            $fallbackChoice = [System.Windows.Forms.MessageBox]::Show(
+                "Graph API Access Denied`n`n" +
+                "Access to sign-in logs via Graph API was denied.`n" +
+                "This is common when Security Defaults are enabled.`n`n" +
+                "Try Exchange Online fallback method instead?",
+                "Access Denied - Use Fallback?",
+                "YesNo",
+                "Question"
             )
+            
+            if ($fallbackChoice -eq "Yes") {
+                return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
+            }
         }
         
         return $null
     }
 }
-
 function Get-AdminAuditData {
     param (
         [Parameter(Mandatory = $false)]
@@ -1998,79 +2461,28 @@ function Get-MessageTraceExchangeOnline {
         [int]$MaxMessages = 5000
     )
     
-    Update-GuiStatus "Starting Exchange Online message trace collection using Get-MessageTraceV2..." ([System.Drawing.Color]::Orange)
+    Update-GuiStatus "Starting Exchange Online message trace collection..." ([System.Drawing.Color]::Orange)
     
     try {
-        # Clean up any existing Exchange Online connections first
-        Update-GuiStatus "Checking for existing Exchange Online connections..." ([System.Drawing.Color]::Orange)
+        # ENHANCED: Check existing Exchange Online connection first
+        Write-Log "Checking Exchange Online connection status..." -Level "Info"
         
-        $existingSessions = Get-PSSession | Where-Object { 
-            $_.ConfigurationName -eq "Microsoft.Exchange" 
-        }
-        
-        if ($existingSessions) {
-            Update-GuiStatus "Disconnecting existing Exchange Online sessions..." ([System.Drawing.Color]::Orange)
-            Write-Log "Found $($existingSessions.Count) existing Exchange Online session(s), disconnecting..." -Level "Info"
+        $connectionResult = Connect-ExchangeOnlineIfNeeded
+        if (-not $connectionResult) {
+            Update-GuiStatus "Exchange Online connection failed - skipping message trace" ([System.Drawing.Color]::Red)
             
-            try {
-                Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop
-                Write-Log "Successfully disconnected existing Exchange Online sessions" -Level "Info"
-            }
-            catch {
-                Write-Log "Warning during disconnect: $($_.Exception.Message)" -Level "Warning"
-                # Force remove sessions if disconnect fails
-                $existingSessions | Remove-PSSession -ErrorAction SilentlyContinue
-            }
+            [System.Windows.Forms.MessageBox]::Show(
+                "Exchange Online Connection Required`n`n" +
+                "Message trace collection requires an active Exchange Online connection.`n`n" +
+                "Please ensure you have Exchange Administrator permissions and try again.`n`n" +
+                "This data collection will be skipped for now.",
+                "Connection Required",
+                "OK",
+                "Warning"
+            )
             
-            # Reset global state
-            if ($Global:ExchangeOnlineState) {
-                $Global:ExchangeOnlineState.IsConnected = $false
-                $Global:ExchangeOnlineState.LastChecked = Get-Date
-                $Global:ExchangeOnlineState.ConnectionAttempts = 0
-            }
+            return @()
         }
-        
-        # Ensure Exchange Online module is available
-        Update-GuiStatus "Checking Exchange Online PowerShell module..." ([System.Drawing.Color]::Orange)
-        
-        if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
-            Update-GuiStatus "Installing Exchange Online module..." ([System.Drawing.Color]::Orange)
-            Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-            Write-Log "Exchange Online module installed for message trace" -Level "Info"
-        }
-        
-        if (-not (Get-Module -Name ExchangeOnlineManagement)) {
-            Update-GuiStatus "Loading Exchange Online module..." ([System.Drawing.Color]::Orange)
-            Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
-            Write-Log "Exchange Online module loaded for message trace" -Level "Info"
-        }
-        
-        # Connect to Exchange Online fresh
-        Update-GuiStatus "Connecting to Exchange Online for message trace..." ([System.Drawing.Color]::Orange)
-        Write-Log "Starting fresh Exchange Online connection for message trace" -Level "Info"
-        
-        Connect-ExchangeOnline -ShowProgress $false -ShowBanner:$false -ErrorAction Stop
-        
-        # Verify connection
-        $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
-        if (-not $testResult) {
-            throw "Exchange Online connection verification failed"
-        }
-        
-        Write-Log "Exchange Online connection verified for message trace" -Level "Info"
-        Update-GuiStatus "Exchange Online connected successfully for message trace" ([System.Drawing.Color]::Green)
-        
-        # Update global state
-        if (-not $Global:ExchangeOnlineState) {
-            $Global:ExchangeOnlineState = @{
-                IsConnected = $false
-                LastChecked = $null
-                ConnectionAttempts = 0
-            }
-        }
-        $Global:ExchangeOnlineState.IsConnected = $true
-        $Global:ExchangeOnlineState.LastChecked = Get-Date
-        $Global:ExchangeOnlineState.ConnectionAttempts = 0
         
         # Calculate date range - keep it conservative
         $actualDaysBack = [Math]::Min($DaysBack, 7)
@@ -2100,13 +2512,6 @@ function Get-MessageTraceExchangeOnline {
             Update-GuiStatus "No messages found in date range" ([System.Drawing.Color]::Orange)
             Write-Log "No messages found for the specified date range" -Level "Warning"
             return @()
-        }
-        
-        # Debug: Check what properties actually exist in Get-MessageTraceV2
-        if ($allMessages.Count -gt 0) {
-            $sampleMessage = $allMessages[0]
-            $availableProperties = $sampleMessage | Get-Member -MemberType Properties | Select-Object -ExpandProperty Name
-            Write-Log "Available properties in Get-MessageTraceV2: $($availableProperties -join ', ')" -Level "Info"
         }
         
         # Convert to ETR format
@@ -4763,58 +5168,71 @@ $form.Controls.Add($btnMessageTrace)
 # Then continue with your existing Row 4 buttons (Run All, Analyze Data, etc.)
 
     # Row 4 - Bulk operations
-    $btnRunAll = New-GuiButton "Run All Data Collection" 30 500 280 45 ([System.Drawing.Color]::FromArgb(255, 193, 7)) {
-        if (-not $Global:ConnectionState.IsConnected) {
-            Update-GuiStatus "Please connect to Microsoft Graph first!" ([System.Drawing.Color]::Red)
-            return
-        }
-        
-        $btnRunAll.Enabled = $false
-        $originalText = $btnRunAll.Text
-        
-        $tasks = @(
-            @{Name="Sign-In Data"; Function="Get-TenantSignInData"},
-            @{Name="Admin Audits"; Function="Get-AdminAuditData"},
-            @{Name="Inbox Rules"; Function="Get-MailboxRules"},
-            @{Name="Delegations"; Function="Get-MailboxDelegationData"},
-            @{Name="App Registrations"; Function="Get-AppRegistrationData"},
-            @{Name="Conditional Access"; Function="Get-ConditionalAccessData"}
-			@{Name="Message Trace"; Function="Get-MessageTraceExchangeOnline"},
-			@{Name="ETR Analysis"; Function="Analyze-ETRData"}
-        )
-        $completed = 0
-        
-        Update-GuiStatus "Starting comprehensive data collection..." ([System.Drawing.Color]::Orange)
-        
-        foreach ($task in $tasks) {
-            $btnRunAll.Text = "Running: $($task.Name)..."
-            Update-GuiStatus "Executing: $($task.Name)..." ([System.Drawing.Color]::Orange)
-            
-            try {
-                switch ($task.Function) {
-                    "Get-TenantSignInData" { Get-TenantSignInData | Out-Null }
-                    "Get-AdminAuditData" { Get-AdminAuditData | Out-Null }
-                    "Get-MailboxRules" { Get-MailboxRules | Out-Null }
-                    "Get-MailboxDelegationData" { Get-MailboxDelegationData | Out-Null }
-                    "Get-AppRegistrationData" { Get-AppRegistrationData | Out-Null }
-                    "Get-ConditionalAccessData" { Get-ConditionalAccessData | Out-Null }
-					"Analyze-ETRData" { Analyze-ETRData | Out-Null }
-                }
-                $completed++
-                Update-GuiStatus "Completed: $($task.Name) ($completed/$($tasks.Count))" ([System.Drawing.Color]::Green)
-            }
-            catch {
-                Write-Log "Error in $($task.Name) collection: $($_.Exception.Message)" -Level "Error"
-                Update-GuiStatus "Error in $($task.Name): $($_.Exception.Message)" ([System.Drawing.Color]::Red)
-            }
-        }
-        
-        $btnRunAll.Enabled = $true
-        $btnRunAll.Text = $originalText
-        Update-GuiStatus "Data collection completed! Finished $completed of $($tasks.Count) tasks successfully." ([System.Drawing.Color]::Green)
-        [System.Windows.Forms.MessageBox]::Show("Data collection completed!`n`nFinished $completed out of $($tasks.Count) tasks successfully.", "Collection Complete", "OK", "Information")
+$btnRunAll = New-GuiButton "Run All Data Collection" 30 500 280 45 ([System.Drawing.Color]::FromArgb(255, 193, 7)) {
+    if (-not $Global:ConnectionState.IsConnected) {
+        Update-GuiStatus "Please connect to Microsoft Graph first!" ([System.Drawing.Color]::Red)
+        return
     }
-    $form.Controls.Add($btnRunAll)
+    
+    $btnRunAll.Enabled = $false
+    $originalText = $btnRunAll.Text
+    
+    $tasks = @(
+        @{Name="Sign-In Data"; Function="Get-TenantSignInData"},
+        @{Name="Admin Audits"; Function="Get-AdminAuditData"},
+        @{Name="Inbox Rules"; Function="Get-MailboxRules"},
+        @{Name="Delegations"; Function="Get-MailboxDelegationData"},
+        @{Name="App Registrations"; Function="Get-AppRegistrationData"},
+        @{Name="Conditional Access"; Function="Get-ConditionalAccessData"},
+        @{Name="Message Trace"; Function="Get-MessageTraceExchangeOnline"},
+        @{Name="ETR Analysis"; Function="Analyze-ETRData"}
+    )
+    $completed = 0
+    
+    Update-GuiStatus "Starting comprehensive data collection..." ([System.Drawing.Color]::Orange)
+    
+    foreach ($task in $tasks) {
+        $btnRunAll.Text = "Running: $($task.Name)..."
+        Update-GuiStatus "Executing: $($task.Name)..." ([System.Drawing.Color]::Orange)
+        
+        try {
+            switch ($task.Function) {
+                "Get-TenantSignInData" { Get-TenantSignInData | Out-Null }
+                "Get-AdminAuditData" { Get-AdminAuditData | Out-Null }
+                "Get-MailboxRules" { Get-MailboxRules | Out-Null }
+                "Get-MailboxDelegationData" { Get-MailboxDelegationData | Out-Null }
+                "Get-AppRegistrationData" { Get-AppRegistrationData | Out-Null }
+                "Get-ConditionalAccessData" { Get-ConditionalAccessData | Out-Null }
+                "Get-MessageTraceExchangeOnline" { Get-MessageTraceExchangeOnline | Out-Null }
+                "Analyze-ETRData" { 
+                    # Get risky IPs from any existing sign-in analysis for ETR correlation
+                    $riskyIPs = @()
+                    $signInDataPath = Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData.csv"
+                    if (Test-Path $signInDataPath) {
+                        try {
+                            $signInData = Import-Csv -Path $signInDataPath
+                            $riskyIPs = $signInData | Where-Object { $_.IsUnusualLocation -eq "True" -and -not [string]::IsNullOrEmpty($_.IP) } | 
+                                       Select-Object -ExpandProperty IP -Unique
+                        } catch { }
+                    }
+                    Analyze-ETRData -RiskyIPs $riskyIPs | Out-Null 
+                }
+            }
+            $completed++
+            Update-GuiStatus "Completed: $($task.Name) ($completed/$($tasks.Count))" ([System.Drawing.Color]::Green)
+        }
+        catch {
+            Write-Log "Error in $($task.Name) collection: $($_.Exception.Message)" -Level "Error"
+            Update-GuiStatus "Error in $($task.Name): $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        }
+    }
+    
+    $btnRunAll.Enabled = $true
+    $btnRunAll.Text = $originalText
+    Update-GuiStatus "Data collection completed! Finished $completed of $($tasks.Count) tasks successfully." ([System.Drawing.Color]::Green)
+    [System.Windows.Forms.MessageBox]::Show("Data collection completed!`n`nFinished $completed out of $($tasks.Count) tasks successfully.", "Collection Complete", "OK", "Information")
+}
+   $form.Controls.Add($btnRunAll)
 
     $btnAnalyze = New-GuiButton "Analyze Data" 330 500 150 45 ([System.Drawing.Color]::FromArgb(220, 53, 69)) {
         $btnAnalyze.Enabled = $false
