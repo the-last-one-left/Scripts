@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "7.8"
+$ScriptVer = "7.9"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -1974,12 +1974,12 @@ function Get-TenantSignInData {
             return $null
         }
         
-        Update-GuiStatus "Retrieved $($signInLogs.Count) total sign-in records. Starting parallel IP processing..." ([System.Drawing.Color]::Orange)
+        Update-GuiStatus "Retrieved $($signInLogs.Count) total sign-in records. Starting IP processing..." ([System.Drawing.Color]::Orange)
         Write-Log "Retrieved $($signInLogs.Count) sign-in records" -Level "Info"
         
-        # Enhanced processing with parallel IP geolocation
+        # Enhanced processing with geolocation
         $results = @()
-        $ipCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+        $ipCache = @{}  # FIXED: Simple hashtable instead of ConcurrentDictionary
         
         # Group and filter unique IPs for geolocation
         Update-GuiStatus "Analyzing unique IP addresses for geolocation..." ([System.Drawing.Color]::Orange)
@@ -1993,143 +1993,41 @@ function Get-TenantSignInData {
         $uniqueIPs = $ipGroups.Name | Where-Object { $_ -ne $null -and $_ -ne "" }
         
         Write-Log "Found $($uniqueIPs.Count) unique IP addresses requiring geolocation from $($validSignIns.Count) valid sign-ins" -Level "Info"
-        Update-GuiStatus "Processing $($uniqueIPs.Count) unique IPs with parallel geolocation..." ([System.Drawing.Color]::Orange)
+        Update-GuiStatus "Processing $($uniqueIPs.Count) unique IPs with geolocation..." ([System.Drawing.Color]::Orange)
         
+        # FIXED: Sequential geolocation processing (no more parallel issues)
         if ($uniqueIPs.Count -gt 0) {
-            # PARALLEL IP GEOLOCATION PROCESSING
-            $maxThreads = [Math]::Min(10, [Math]::Max(2, [Environment]::ProcessorCount))
-            $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxThreads)
-            $runspacePool.Open()
+            Write-Log "Starting geolocation for $($uniqueIPs.Count) unique IPs" -Level "Info"
             
-            Write-Log "Starting parallel IP geolocation with $maxThreads threads" -Level "Info"
+            $processedCount = 0
             
-            # Split IPs into batches for parallel processing
-            $batchSize = [Math]::Max(10, [Math]::Ceiling($uniqueIPs.Count / $maxThreads))
-            $ipBatches = @()
-            
-            for ($i = 0; $i -lt $uniqueIPs.Count; $i += $batchSize) {
-                $batch = $uniqueIPs[$i..([Math]::Min($i + $batchSize - 1, $uniqueIPs.Count - 1))]
-                if ($batch) {
-                    $ipBatches += ,@($batch)  # Force array creation
+            foreach ($ip in $uniqueIPs) {
+                $processedCount++
+                
+                # Progress update
+                if ($processedCount % 5 -eq 0 -or $processedCount -eq $uniqueIPs.Count) {
+                    $percentage = [Math]::Round(($processedCount / $uniqueIPs.Count) * 100, 1)
+                    Update-GuiStatus "Geolocating IPs: $processedCount/$($uniqueIPs.Count) ($percentage%)" ([System.Drawing.Color]::Orange)
+                    [System.Windows.Forms.Application]::DoEvents()
                 }
-            }
-            
-            Write-Log "Created $($ipBatches.Count) IP batches for parallel processing" -Level "Info"
-            
-            # Create parallel jobs for IP geolocation
-            $jobs = @()
-            $apiKey = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ConfigData.IPStackAPIKey))
-            
-            foreach ($batch in $ipBatches) {
-                $powerShell = [powershell]::Create()
-                $powerShell.RunspacePool = $runspacePool
                 
-                # Geolocation script block
-                [void]$powerShell.AddScript({
-                    param($ips, $apiKey, $cache, $retryCount, $retryDelay)
-                    
-                    foreach ($ip in $ips) {
-                        # Skip if already in cache
-                        if ($cache.ContainsKey($ip)) {
-                            continue
-                        }
-                        
-                        $success = $false
-                        $attempts = 0
-                        
-                        while (-not $success -and $attempts -lt $retryCount) {
-                            $attempts++
-                            try {
-                                # Add jitter to prevent API rate limiting
-                                $jitter = Get-Random -Minimum 100 -Maximum 300
-                                Start-Sleep -Milliseconds $jitter
-                                
-                                $url = "https://api.ipstack.com/{0}?access_key=$apiKey" -f $ip
-                                $result = Invoke-RestMethod -Method Get -Uri $url -TimeoutSec 15 -ErrorAction Stop
-                                
-                                # Validate response
-                                if ($result -and $result.ip) {
-                                    $cache[$ip] = @{
-                                        Data = $result
-                                        CachedAt = Get-Date
-                                        Source = "API"
-                                    }
-                                    $success = $true
-                                } else {
-                                    throw "Invalid API response for IP $ip"
-                                }
-                            }
-                            catch {
-                                if ($attempts -lt $retryCount) {
-                                    # Exponential backoff
-                                    $waitTime = [Math]::Pow(2, $attempts - 1) * $retryDelay
-                                    Start-Sleep -Seconds $waitTime
-                                } else {
-                                    # Create failure result after all retries
-                                    $cache[$ip] = @{
-                                        Data = [PSCustomObject]@{
-                                            ip = $ip
-                                            city = "Unknown"
-                                            region_name = "Unknown"
-                                            country_name = "Unknown"
-                                            connection = @{ isp = "Unknown" }
-                                        }
-                                        CachedAt = Get-Date
-                                        Source = "Failed"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                })
-                
-                [void]$powerShell.AddParameter("ips", $batch)
-                [void]$powerShell.AddParameter("apiKey", $apiKey)
-                [void]$powerShell.AddParameter("cache", $ipCache)
-                [void]$powerShell.AddParameter("retryCount", 3)
-                [void]$powerShell.AddParameter("retryDelay", 2)
-                
-                $jobs += @{
-                    PowerShell = $powerShell
-                    Handle = $powerShell.BeginInvoke()
-                    BatchSize = $batch.Count
-                }
-            }
-            
-            # Monitor parallel job progress
-            $completedJobs = 0
-            $totalJobs = $jobs.Count
-            
-            Update-GuiStatus "Running $totalJobs parallel geolocation jobs..." ([System.Drawing.Color]::Orange)
-            
-            while ($completedJobs -lt $totalJobs) {
-                Start-Sleep -Seconds 2
-                $newCompletedCount = ($jobs | Where-Object { $_.Handle.IsCompleted }).Count
-                
-                if ($newCompletedCount -gt $completedJobs) {
-                    $completedJobs = $newCompletedCount
-                    $percentage = [Math]::Round(($completedJobs / $totalJobs) * 100, 1)
-                    $cachedCount = $ipCache.Count
-                    Update-GuiStatus "Geolocation progress: $completedJobs/$totalJobs jobs completed ($percentage%) - $cachedCount IPs processed" ([System.Drawing.Color]::Orange)
-                }
-            }
-            
-            # Wait for all jobs to complete and cleanup
-            Update-GuiStatus "Finalizing parallel geolocation processing..." ([System.Drawing.Color]::Orange)
-            
-            foreach ($job in $jobs) {
                 try {
-                    $job.PowerShell.EndInvoke($job.Handle)
+                    # Use your existing Invoke-IPGeolocation function
+                    $geoResult = Invoke-IPGeolocation -IPAddress $ip -Cache $ipCache
+                    
+                    if ($geoResult) {
+                        Write-Log "Geolocated $ip`: $($geoResult.city), $($geoResult.region_name), $($geoResult.country_name)" -Level "Info"
+                    }
+                    
+                    # Small delay to avoid rate limiting
+                    Start-Sleep -Milliseconds 150
+                    
                 } catch {
-                    Write-Log "Job completion warning: $($_.Exception.Message)" -Level "Warning"
+                    Write-Log "Error geolocating IP $ip`: $($_.Exception.Message)" -Level "Warning"
                 }
-                $job.PowerShell.Dispose()
             }
             
-            $runspacePool.Close()
-            $runspacePool.Dispose()
-            
-            Write-Log "Parallel geolocation completed. Processed $($ipCache.Count) unique IPs" -Level "Info"
+            Write-Log "Geolocation completed for $($ipCache.Count) IPs" -Level "Info"
         }
         
         # Process sign-in records with cached geolocation data
@@ -2160,26 +2058,31 @@ function Get-TenantSignInData {
                 $country = "Unknown"
                 $isp = "Unknown"
                 
-                # Get geolocation data from cache if available
-                if (-not [string]::IsNullOrEmpty($ip) -and $ip -ne "127.0.0.1" -and $ipCache.ContainsKey($ip)) {
-                    $geoData = $ipCache[$ip].Data
-                    if ($geoData) {
-                        $city = if ($geoData.city) { $geoData.city } else { "Unknown" }
-                        $region = if ($geoData.region_name) { $geoData.region_name } else { "Unknown" }
-                        $country = if ($geoData.country_name) { $geoData.country_name } else { "Unknown" }
-                        $isp = if ($geoData.connection -and $geoData.connection.isp) { $geoData.connection.isp } else { "Unknown" }
-                        
-                        # Check if location is unusual
-                        $isUnusual = $ConfigData.ExpectedCountries -notcontains $country
-                    }
-                } elseif (-not [string]::IsNullOrEmpty($ip)) {
-                    # Handle private/local IPs
+                # FIXED: Better geolocation data extraction
+                if (-not [string]::IsNullOrEmpty($ip) -and $ip -ne "127.0.0.1") {
+                    # Check if it's a private IP first
                     if ($ip -match "^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\.|^127\.") {
                         $country = "Private/Local"
                         $city = "Private Network"
                         $region = "Private Network"
                         $isp = "Private Network"
                         $isUnusual = $false
+                    } elseif ($ipCache.ContainsKey($ip)) {
+                        $cacheEntry = $ipCache[$ip]
+                        if ($cacheEntry -and $cacheEntry.Data) {
+                            $geoData = $cacheEntry.Data
+                            
+                            # Better null checking
+                            $city = if ($geoData.city -and $geoData.city -ne "null" -and $geoData.city -ne "") { $geoData.city } else { "Unknown" }
+                            $region = if ($geoData.region_name -and $geoData.region_name -ne "null" -and $geoData.region_name -ne "") { $geoData.region_name } else { "Unknown" }
+                            $country = if ($geoData.country_name -and $geoData.country_name -ne "null" -and $geoData.country_name -ne "") { $geoData.country_name } else { "Unknown" }
+                            $isp = if ($geoData.connection -and $geoData.connection.isp -and $geoData.connection.isp -ne "null" -and $geoData.connection.isp -ne "") { $geoData.connection.isp } else { "Unknown" }
+                            
+                            # Check if location is unusual
+                            if ($country -ne "Unknown") {
+                                $isUnusual = $ConfigData.ExpectedCountries -notcontains $country
+                            }
+                        }
                     }
                 }
                 
@@ -2266,6 +2169,7 @@ function Get-TenantSignInData {
         return $null
     }
 }
+
 function Get-AdminAuditData {
     param (
         [Parameter(Mandatory = $false)]
