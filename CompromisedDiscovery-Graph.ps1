@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "8.1"
+$ScriptVer = "8.2"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -21,7 +21,7 @@ $Global:ConnectionState = @{
 }
 
 $ConfigData = @{
-    WorkDir = "C:\Temp\"
+	WorkDir = "C:\Temp\"
     DateRange = 14
     # API key is encoded to avoid plain text - not truly secure but better than plaintext
     IPStackAPIKey = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("5f8d47763f5761d29f9af71460d94cd5"))
@@ -868,15 +868,20 @@ function Invoke-IPGeolocation {
         }
     }
     
-    # Decode the API key
+    # Try IPStack first (primary service)
     $apiKey = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ConfigData.IPStackAPIKey))
     
-    # Implement retry logic with exponential backoff
     for ($i = 0; $i -lt $RetryCount; $i++) {
         try {
-            Start-Sleep -Milliseconds (Get-Random -Minimum 100 -Maximum 500) # Add jitter for rate limiting
-            $url = "https://api.ipstack.com/{0}?access_key=$apiKey" -f $IPAddress
+            Start-Sleep -Milliseconds (Get-Random -Minimum 100 -Maximum 500)
+            $url = "{0}/{1}?access_key={2}" -f $ConfigData.IPStackAPI, $IPAddress, $apiKey
             $result = Invoke-RestMethod -Method Get -Uri $url -TimeoutSec 30 -ErrorAction Stop
+            
+            # Check if IPStack returned an error
+            if ($result.error) {
+                Write-Log "IPStack error for ${IPAddress}: $($result.error.type) - $($result.error.info)" -Level "Warning"
+                throw "IPStack API error: $($result.error.type)"
+            }
             
             # Cache the result
             $Cache[$IPAddress] = @{
@@ -884,10 +889,11 @@ function Invoke-IPGeolocation {
                 CachedAt = Get-Date
             }
             
+            Write-Log "Successfully geolocated $IPAddress using IPStack" -Level "Info"
             return $result
         }
         catch {
-            Write-Log "Error querying IP Stack API for $IPAddress. Attempt $($i+1)/$RetryCount. Error: $($_.Exception.Message)" -Level "Warning"
+            Write-Log "IPStack attempt $($i+1)/$RetryCount failed for ${IPAddress}: $($_.Exception.Message)" -Level "Warning"
             
             if ($i -lt $RetryCount - 1) {
                 $waitTime = [math]::Pow(2, $i) * $RetryDelay
@@ -896,9 +902,49 @@ function Invoke-IPGeolocation {
         }
     }
     
-    Write-Log "Failed to get geolocation data for IP $IPAddress after $RetryCount attempts" -Level "Error"
+    # IPStack failed, try fallback service (ip-api.com - free, no key required)
+    Write-Log "IPStack failed for $IPAddress, trying fallback service (ip-api.com)" -Level "Warning"
     
-    # Return a blank object with the same structure if all retries fail
+    try {
+        Start-Sleep -Milliseconds 500  # Rate limiting for free service
+        $fallbackUrl = "http://ip-api.com/json/{0}?fields=status,message,country,countryCode,region,regionName,city,lat,lon,isp,org,as,query" -f $IPAddress
+        $fallbackResult = Invoke-RestMethod -Method Get -Uri $fallbackUrl -TimeoutSec 30 -ErrorAction Stop
+        
+        # Check if request was successful
+        if ($fallbackResult.status -ne "success") {
+            throw "Fallback API error: $($fallbackResult.message)"
+        }
+        
+        # Convert fallback format to match IPStack format for compatibility
+        $normalizedResult = [PSCustomObject]@{
+            ip = $fallbackResult.query
+            city = $fallbackResult.city
+            region_name = $fallbackResult.regionName
+            country_name = $fallbackResult.country
+            connection = @{ 
+                isp = if ($fallbackResult.isp) { $fallbackResult.isp } 
+                      elseif ($fallbackResult.org) { $fallbackResult.org } 
+                      else { "Unknown" }
+            }
+            fallback_source = "ip-api.com"
+        }
+        
+        # Cache the result
+        $Cache[$IPAddress] = @{
+            Data = $normalizedResult
+            CachedAt = Get-Date
+        }
+        
+        Write-Log "Successfully geolocated $IPAddress using fallback service (ip-api.com)" -Level "Info"
+        return $normalizedResult
+    }
+    catch {
+        Write-Log "Fallback geolocation also failed for ${IPAddress}: $($_.Exception.Message)" -Level "Error"
+    }
+    
+    # All services failed - return blank object
+    Write-Log "All geolocation services failed for IP $IPAddress" -Level "Error"
+    
     $failureResult = [PSCustomObject]@{
         ip = $IPAddress
         city = "Unknown"
@@ -907,7 +953,7 @@ function Invoke-IPGeolocation {
         connection = @{ isp = "Unknown" }
     }
     
-    # Cache the failure result too to avoid repeated API calls
+    # Cache the failure result
     $Cache[$IPAddress] = @{
         Data = $failureResult
         CachedAt = Get-Date
