@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "8.0"
+$ScriptVer = "8.1"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -1360,6 +1360,142 @@ function Connect-TenantServices {
         return $false
     }
 }
+
+function Connect-ExchangeOnlineIfNeeded {
+    <#
+    .SYNOPSIS
+    Checks for existing Exchange Online connection and connects if needed
+    .DESCRIPTION
+    Verifies Exchange Online connectivity and establishes connection if required.
+    Updates global connection state tracking.
+    #>
+    
+    try {
+        # Check if Exchange Online module is available
+        if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
+            Write-Log "Exchange Online module not found - attempting to install..." -Level "Warning"
+            Update-GuiStatus "Installing Exchange Online module..." ([System.Drawing.Color]::Orange)
+            
+            try {
+                Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
+                Write-Log "Exchange Online module installed successfully" -Level "Info"
+            }
+            catch {
+                Write-Log "Failed to install Exchange Online module: $($_.Exception.Message)" -Level "Error"
+                Update-GuiStatus "Exchange Online module installation failed" ([System.Drawing.Color]::Red)
+                return $false
+            }
+        }
+        
+        # Import module if not already loaded
+        if (-not (Get-Module -Name ExchangeOnlineManagement)) {
+            Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
+        }
+        
+        # Check for existing connection by testing a simple command
+        Update-GuiStatus "Checking Exchange Online connection..." ([System.Drawing.Color]::Orange)
+        
+        $isConnected = $false
+        try {
+            # Quick test - this will fail if not connected
+            $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
+            if ($testResult) {
+                $isConnected = $true
+                Write-Log "Exchange Online connection verified - already connected" -Level "Info"
+                
+                # Update global state
+                if (-not $Global:ExchangeOnlineState) {
+                    $Global:ExchangeOnlineState = @{
+                        IsConnected = $true
+                        LastChecked = Get-Date
+                        ConnectionAttempts = 0
+                    }
+                }
+                else {
+                    $Global:ExchangeOnlineState.IsConnected = $true
+                    $Global:ExchangeOnlineState.LastChecked = Get-Date
+                }
+                
+                Update-GuiStatus "Exchange Online connection verified" ([System.Drawing.Color]::Green)
+                return $true
+            }
+        }
+        catch {
+            Write-Log "No existing Exchange Online connection found" -Level "Info"
+            $isConnected = $false
+        }
+        
+        # If not connected, attempt to connect
+        if (-not $isConnected) {
+            Update-GuiStatus "Connecting to Exchange Online..." ([System.Drawing.Color]::Orange)
+            Write-Log "Attempting to connect to Exchange Online..." -Level "Info"
+            
+            try {
+                # Connect using modern auth (inherits credentials from Microsoft Graph if possible)
+                Connect-ExchangeOnline -ShowProgress $false -ShowBanner:$false -ErrorAction Stop
+                
+                # Verify connection worked
+                $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
+                if ($testResult) {
+                    Write-Log "Exchange Online connection established successfully" -Level "Info"
+                    Update-GuiStatus "Connected to Exchange Online successfully" ([System.Drawing.Color]::Green)
+                    
+                    # Initialize/update global state
+                    $Global:ExchangeOnlineState = @{
+                        IsConnected = $true
+                        LastChecked = Get-Date
+                        ConnectionAttempts = 0
+                    }
+                    
+                    return $true
+                }
+                else {
+                    throw "Connection succeeded but verification failed"
+                }
+            }
+            catch {
+                Write-Log "Failed to connect to Exchange Online: $($_.Exception.Message)" -Level "Error"
+                Update-GuiStatus "Exchange Online connection failed" ([System.Drawing.Color]::Red)
+                
+                # Update global state
+                if (-not $Global:ExchangeOnlineState) {
+                    $Global:ExchangeOnlineState = @{
+                        IsConnected = $false
+                        LastChecked = Get-Date
+                        ConnectionAttempts = 1
+                    }
+                }
+                else {
+                    $Global:ExchangeOnlineState.IsConnected = $false
+                    $Global:ExchangeOnlineState.LastChecked = Get-Date
+                    $Global:ExchangeOnlineState.ConnectionAttempts++
+                }
+                
+                return $false
+            }
+        }
+        
+        return $isConnected
+        
+    }
+    catch {
+        Write-Log "Error in Connect-ExchangeOnlineIfNeeded: $($_.Exception.Message)" -Level "Error"
+        Update-GuiStatus "Exchange Online connection check failed" ([System.Drawing.Color]::Red)
+        
+        # Update global state on error
+        if (-not $Global:ExchangeOnlineState) {
+            $Global:ExchangeOnlineState = @{
+                IsConnected = $false
+                LastChecked = Get-Date
+                ConnectionAttempts = 1
+            }
+        }
+        
+        return $false
+    }
+}
+
 
 # FIXED: Helper function to reset Exchange Online connection state
 function Reset-ExchangeOnlineConnectionState {
