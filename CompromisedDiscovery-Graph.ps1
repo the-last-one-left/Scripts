@@ -11,7 +11,7 @@
 
 # Module structure - Main script file
 # Load configuration and required modules
-$ScriptVer = "7.9"
+$ScriptVer = "8.0"
 $Global:ConnectionState = @{
     IsConnected = $false
     TenantId = $null
@@ -152,259 +152,121 @@ function Write-Log {
     }
 }
 
-function Connect-ExchangeOnlineIfNeeded {
+function Test-ScriptVersion {
     <#
     .SYNOPSIS
-    Connects to Exchange Online only if not already connected with proper state management
+    Checks if the script is running the latest version from GitHub
     .DESCRIPTION
-    Checks for existing Exchange Online session and only prompts for connection if needed
+    Compares the current script version with the version available on GitHub
+    and prompts the user to update if a newer version is available
     #>
     
+    param (
+        [Parameter(Mandatory = $false)]
+        [string]$GitHubUrl = "https://raw.githubusercontent.com/the-last-one-left/Scripts/refs/heads/main/CompromisedDiscovery-Graph.ps1",
+        
+        [Parameter(Mandatory = $false)]
+        [bool]$ShowMessageBox = $true
+    )
+    
     try {
-        # FIXED: Add global tracking for Exchange Online connection state
-        if (-not $Global:ExchangeOnlineState) {
-            $Global:ExchangeOnlineState = @{
-                IsConnected = $false
-                LastChecked = $null
-                ConnectionAttempts = 0
-            }
-        }
+        Update-GuiStatus "Checking for script updates..." ([System.Drawing.Color]::Orange)
+        Write-Log "Checking script version against GitHub repository" -Level "Info"
         
-        # FIXED: Don't re-check connection too frequently (cache for 30 seconds)
-        if ($Global:ExchangeOnlineState.LastChecked -and 
-            ((Get-Date) - $Global:ExchangeOnlineState.LastChecked).TotalSeconds -lt 30 -and
-            $Global:ExchangeOnlineState.IsConnected) {
-            Write-Log "Using cached Exchange Online connection status (connected)" -Level "Info"
-            Update-GuiStatus "Using existing Exchange Online connection" ([System.Drawing.Color]::Green)
-            return $true
-        }
+        # Fetch the latest script content from GitHub
+        $latestScriptContent = Invoke-WebRequest -Uri $GitHubUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         
-        # FIXED: More robust connection testing with multiple methods
-        Write-Log "Testing Exchange Online connection..." -Level "Info"
-        $isConnected = $false
+        # Extract the version number from the GitHub script
+        # Fixed: Properly escape quotes in PowerShell regex pattern
+        $versionPattern = '\$ScriptVer\s*=\s*["'']([0-9.]+)["'']'
         
-        # Method 1: Check PowerShell sessions
-        try {
-            $exchangeSession = Get-PSSession | Where-Object { 
-                $_.ConfigurationName -eq "Microsoft.Exchange" -and 
-                $_.State -eq "Opened" -and
-                $_.ComputerName -like "*outlook.office365.com*"
-            } | Select-Object -First 1
+        if ($latestScriptContent.Content -match $versionPattern) {
+            $latestVersion = $matches[1]
+            $currentVersion = $ScriptVer
             
-            if ($exchangeSession) {
-                Write-Log "Found active Exchange Online PowerShell session" -Level "Info"
+            Write-Log "Current version: $currentVersion | Latest version: $latestVersion" -Level "Info"
+            
+            # Compare versions
+            if ($latestVersion -eq $currentVersion) {
+                Update-GuiStatus "Script is up to date (v$currentVersion)" ([System.Drawing.Color]::Green)
+                Write-Log "Script is running the latest version" -Level "Info"
                 
-                # Method 2: Test with a simple command
-                try {
-                    $testResult = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
-                    if ($testResult) {
-                        $isConnected = $true
-                        Write-Log "Exchange Online connection verified with Get-AcceptedDomain" -Level "Info"
-                    }
-                } catch {
-                    Write-Log "Get-AcceptedDomain test failed: $($_.Exception.Message)" -Level "Warning"
-                    # Session exists but command failed - connection may be stale
-                    $isConnected = $false
+                if ($ShowMessageBox) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "You are running the latest version!`n`nCurrent Version: $currentVersion`nLatest Version: $latestVersion",
+                        "Version Check - Up to Date",
+                        "OK",
+                        "Information"
+                    )
                 }
-            }
-        } catch {
-            Write-Log "PowerShell session check failed: $($_.Exception.Message)" -Level "Info"
-        }
-        
-        # Method 3: Try Get-ConnectionInformation (if available in newer versions)
-        if (-not $isConnected) {
-            try {
-                $connectionInfo = Get-ConnectionInformation -ErrorAction Stop
-                if ($connectionInfo -and $connectionInfo.Count -gt 0) {
-                    $isConnected = $true
-                    Write-Log "Exchange Online connection verified with Get-ConnectionInformation" -Level "Info"
-                }
-            } catch {
-                # Get-ConnectionInformation not available or failed
-                Write-Log "Get-ConnectionInformation not available or failed" -Level "Info"
-            }
-        }
-        
-        # Update connection state cache
-        $Global:ExchangeOnlineState.LastChecked = Get-Date
-        $Global:ExchangeOnlineState.IsConnected = $isConnected
-        
-        if ($isConnected) {
-            Write-Log "Exchange Online connection verified - already connected" -Level "Info"
-            Update-GuiStatus "Using existing Exchange Online connection" ([System.Drawing.Color]::Green)
-            return $true
-        }
-        
-        # FIXED: Not connected - check if we should attempt connection
-        Write-Log "No active Exchange Online connection found" -Level "Info"
-        
-        # FIXED: Prevent infinite connection attempts
-        if ($Global:ExchangeOnlineState.ConnectionAttempts -ge 3) {
-            Write-Log "Maximum Exchange Online connection attempts reached (3). Skipping automatic connection." -Level "Warning"
-            Update-GuiStatus "Exchange Online connection attempts exceeded - manual connection required" ([System.Drawing.Color]::Red)
-            
-            $manualConnectChoice = [System.Windows.Forms.MessageBox]::Show(
-                "Exchange Online Connection Required`n`n" +
-                "Multiple automatic connection attempts have failed.`n`n" +
-                "Would you like to manually attempt connection now?`n`n" +
-                "Click 'No' to skip Exchange Online features for this session.",
-                "Manual Connection Required",
-                "YesNo",
-                "Question"
-            )
-            
-            if ($manualConnectChoice -eq "No") {
-                Write-Log "User chose to skip Exchange Online connection" -Level "Info"
-                return $false
-            } else {
-                # Reset attempt counter for manual connection
-                $Global:ExchangeOnlineState.ConnectionAttempts = 0
-            }
-        }
-        
-        # Check if Exchange Online module is available
-        if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
-            Update-GuiStatus "Exchange Online module not found - prompting for installation..." ([System.Drawing.Color]::Orange)
-            
-            $installChoice = [System.Windows.Forms.MessageBox]::Show(
-                "Exchange Online PowerShell module is required.`n`nInstall Exchange Online module now?",
-                "Module Installation Required",
-                "YesNo",
-                "Question"
-            )
-            
-            if ($installChoice -eq "Yes") {
-                Update-GuiStatus "Installing Exchange Online PowerShell module..." ([System.Drawing.Color]::Orange)
-                try {
-                    Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-                    Write-Log "Exchange Online module installed successfully" -Level "Info"
-                } catch {
-                    Write-Log "Failed to install Exchange Online module: $($_.Exception.Message)" -Level "Error"
-                    Update-GuiStatus "Exchange Online module installation failed" ([System.Drawing.Color]::Red)
-                    return $false
-                }
-            } else {
-                Write-Log "User declined Exchange Online module installation" -Level "Info"
-                Update-GuiStatus "Exchange Online module installation declined" ([System.Drawing.Color]::Orange)
-                return $false
-            }
-        }
-        
-        # Import the module
-        if (-not (Get-Module -Name ExchangeOnlineManagement)) {
-            try {
-                Import-Module ExchangeOnlineManagement -Force -ErrorAction Stop
-                Write-Log "Exchange Online module imported" -Level "Info"
-            } catch {
-                Write-Log "Failed to import Exchange Online module: $($_.Exception.Message)" -Level "Error"
-                Update-GuiStatus "Failed to import Exchange Online module" ([System.Drawing.Color]::Red)
-                return $false
-            }
-        }
-        
-        # FIXED: Increment connection attempt counter
-        $Global:ExchangeOnlineState.ConnectionAttempts++
-        
-        # Connect to Exchange Online
-        Write-Log "Attempting to connect to Exchange Online (Attempt #$($Global:ExchangeOnlineState.ConnectionAttempts))" -Level "Info"
-        Update-GuiStatus "Connecting to Exchange Online..." ([System.Drawing.Color]::Orange)
-        
-        [System.Windows.Forms.MessageBox]::Show(
-            "Exchange Online Authentication Required`n`n" +
-            "A browser window will open for Exchange Online authentication.`n" +
-            "Please sign in with an account that has Exchange Administrator permissions.`n`n" +
-            "This connection will be reused for all Exchange Online operations.`n`n" +
-            "Attempt #$($Global:ExchangeOnlineState.ConnectionAttempts) of 3",
-            "Authentication Required",
-            "OK",
-            "Information"
-        )
-        
-        try {
-            # FIXED: Use Connect-ExchangeOnline with better error handling
-            Connect-ExchangeOnline -ShowProgress $true -ShowBanner:$false -ErrorAction Stop
-            
-            # FIXED: Wait longer for connection to stabilize
-            Write-Log "Waiting for Exchange Online connection to stabilize..." -Level "Info"
-            Start-Sleep -Seconds 5
-            
-            # FIXED: More thorough connection verification
-            $verificationAttempts = 0
-            $maxVerificationAttempts = 3
-            $connectionVerified = $false
-            
-            while ($verificationAttempts -lt $maxVerificationAttempts -and -not $connectionVerified) {
-                $verificationAttempts++
-                Update-GuiStatus "Verifying Exchange Online connection (attempt $verificationAttempts)..." ([System.Drawing.Color]::Orange)
                 
-                try {
-                    # Try multiple verification methods
-                    $verifyConnection = Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1
-                    if ($verifyConnection) {
-                        $connectionVerified = $true
-                        Write-Log "Exchange Online connection verified successfully" -Level "Info"
+                return @{
+                    IsLatest = $true
+                    CurrentVersion = $currentVersion
+                    LatestVersion = $latestVersion
+                }
+            }
+            else {
+                Update-GuiStatus "Update available! Current: v$currentVersion | Latest: v$latestVersion" ([System.Drawing.Color]::Orange)
+                Write-Log "Newer version available: $latestVersion (current: $currentVersion)" -Level "Warning"
+                
+                if ($ShowMessageBox) {
+                    $updateChoice = [System.Windows.Forms.MessageBox]::Show(
+                        "A newer version of the script is available!`n`n" +
+                        "Current Version: $currentVersion`n" +
+                        "Latest Version: $latestVersion`n`n" +
+                        "Would you like to download the latest version?`n`n" +
+                        "Note: The script will open in your default browser.",
+                        "Update Available",
+                        "YesNo",
+                        "Information"
+                    )
+                    
+                    if ($updateChoice -eq "Yes") {
+                        # Open the GitHub page in default browser
+                        Start-Process "https://github.com/the-last-one-left/Scripts/blob/main/CompromisedDiscovery-Graph.ps1"
+                        Update-GuiStatus "Opening GitHub page for update download..." ([System.Drawing.Color]::Green)
+                        Write-Log "User chose to update - opening GitHub page" -Level "Info"
                     }
-                } catch {
-                    Write-Log "Connection verification attempt $verificationAttempts failed: $($_.Exception.Message)" -Level "Warning"
-                    if ($verificationAttempts -lt $maxVerificationAttempts) {
-                        Start-Sleep -Seconds 3
+                    else {
+                        Update-GuiStatus "Update declined by user" ([System.Drawing.Color]::Orange)
+                        Write-Log "User declined to update" -Level "Info"
                     }
                 }
-            }
-            
-            if ($connectionVerified) {
-                # FIXED: Update connection state on successful connection
-                $Global:ExchangeOnlineState.IsConnected = $true
-                $Global:ExchangeOnlineState.LastChecked = Get-Date
-                $Global:ExchangeOnlineState.ConnectionAttempts = 0  # Reset on success
                 
-                Write-Log "Exchange Online connection successful and verified" -Level "Info"
-                Update-GuiStatus "Connected to Exchange Online successfully" ([System.Drawing.Color]::Green)
-                return $true
-            } else {
-                throw "Connection verification failed after $maxVerificationAttempts attempts"
+                return @{
+                    IsLatest = $false
+                    CurrentVersion = $currentVersion
+                    LatestVersion = $latestVersion
+                }
             }
-            
-        } catch {
-            Write-Log "Failed to connect to Exchange Online: $($_.Exception.Message)" -Level "Error"
-            Update-GuiStatus "Failed to connect to Exchange Online" ([System.Drawing.Color]::Red)
-            
-            # FIXED: Update connection state on failure
-            $Global:ExchangeOnlineState.IsConnected = $false
-            $Global:ExchangeOnlineState.LastChecked = Get-Date
-            
-            $errorDetails = $_.Exception.Message
-            if ($errorDetails -like "*authentication*" -or $errorDetails -like "*login*") {
-                $errorType = "Authentication failed"
-            } elseif ($errorDetails -like "*permission*" -or $errorDetails -like "*access*") {
-                $errorType = "Insufficient permissions"
-            } else {
-                $errorType = "Connection error"
-            }
-            
+        }
+        else {
+            throw "Could not parse version number from GitHub script"
+        }
+    }
+    catch {
+        Update-GuiStatus "Version check failed: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Error checking for updates: $($_.Exception.Message)" -Level "Error"
+        
+        if ($ShowMessageBox) {
             [System.Windows.Forms.MessageBox]::Show(
-                "Failed to connect to Exchange Online:`n`n" +
-                "Error Type: $errorType`n" +
-                "Details: $errorDetails`n`n" +
-                "Please ensure you have Exchange Administrator permissions.`n`n" +
-                "Attempt $($Global:ExchangeOnlineState.ConnectionAttempts) of 3",
-                "Connection Failed",
+                "Unable to check for updates.`n`n" +
+                "Error: $($_.Exception.Message)`n`n" +
+                "Current Version: $ScriptVer`n`n" +
+                "Please check your internet connection or visit GitHub manually.",
+                "Version Check Failed",
                 "OK",
-                "Error"
+                "Warning"
             )
-            
-            return $false
         }
         
-    } catch {
-        Write-Log "Unexpected error in Exchange Online connection function: $($_.Exception.Message)" -Level "Error"
-        Update-GuiStatus "Unexpected error in Exchange Online connection" ([System.Drawing.Color]::Red)
-        
-        # FIXED: Update connection state on unexpected error
-        $Global:ExchangeOnlineState.IsConnected = $false
-        $Global:ExchangeOnlineState.LastChecked = Get-Date
-        
-        return $false
+        return @{
+            IsLatest = $null
+            CurrentVersion = $ScriptVer
+            LatestVersion = $null
+            Error = $_.Exception.Message
+        }
     }
 }
 
@@ -5326,7 +5188,12 @@ $btnRunAll = New-GuiButton "Run All Data Collection" 30 500 280 45 ([System.Draw
         # Check for existing connection when GUI loads
         Test-ExistingGraphConnection | Out-Null
         Update-ConnectionStatus
-        
+         $versionCheck = Test-ScriptVersion -ShowMessageBox $false
+		 if ($versionCheck.IsLatest -eq $false) {
+        # Only show message box if update is available
+        Test-ScriptVersion -ShowMessageBox $true
+    }
+	
         if ($Global:ConnectionState.IsConnected) {
             Update-GuiStatus "Application ready - Using existing Microsoft Graph connection" ([System.Drawing.Color]::Green)
         } else {
