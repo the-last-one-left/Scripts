@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "9.1"
+$ScriptVer = "9.2"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -2749,6 +2749,68 @@ function Show-AuditLogStatusWarning {
 # SIGN-IN DATA COLLECTION
 #══════════════════════════════════════════════════════════════
 
+function Get-SignInStatusDescription {
+    <#
+    .SYNOPSIS
+        Converts Azure AD sign-in error codes to human-readable descriptions
+    #>
+    param (
+        [Parameter(Mandatory = $false)]
+        [string]$StatusCode
+    )
+    
+    # Status code lookup table
+    $statusCodes = @{
+        "0"      = "Success"
+        "50053"  = "Account locked - IdsLocked"
+        "50055"  = "Password expired - InvalidPasswordExpiredPassword"
+        "50056"  = "Invalid or null password"
+        "50057"  = "User account disabled"
+        "50058"  = "User information required"
+        "50074"  = "MFA required but not completed"
+        "50076"  = "MFA challenge required (not yet completed)"
+        "50079"  = "User needs to enroll for MFA"
+        "50125"  = "Sign-in interrupted by password reset or registration"
+        "50126"  = "Invalid username or password"
+        "50132"  = "Session revoked - credentials have been revoked"
+        "50133"  = "Session expired - password expired"
+        "50140"  = "Interrupt - sign-in kept alive"
+        "50144"  = "Active Directory password expired"
+        "50158"  = "External security challenge not satisfied"
+        "51004"  = "User account doesn't exist in directory"
+        "53003"  = "Blocked by Conditional Access policy"
+        "53004"  = "Proof-up required - user needs to complete registration"
+        "54000"  = "Missing required claim"
+        "65001"  = "Consent required - user or admin consent needed"
+        "65004"  = "User declined to consent"
+        "70008"  = "Authorization code expired or already used"
+        "80012"  = "OnPremises password validation - account sign-in hours"
+        "81010"  = "Deserialization error"
+        "90010"  = "Grant type not supported"
+        "90014"  = "Required field missing from credential"
+        "90072"  = "Pass-through auth - account validation failed"
+        "90095"  = "Admin consent required"
+        "500011" = "Resource principal not found in tenant"
+        "500121" = "Authentication failed during strong auth request"
+        "500133" = "Assertion is not within valid time range"
+        "530032" = "Blocked by Conditional Access - tenant security policy"
+        "700016" = "Application not found in directory"
+        "700082" = "Refresh token has expired"
+        "7000218" = "Request body too large"
+    }
+    
+    if ([string]::IsNullOrEmpty($StatusCode)) {
+        return "Success"
+    }
+    
+    if ($statusCodes.ContainsKey($StatusCode)) {
+        return $statusCodes[$StatusCode]
+    }
+    else {
+        return "Error Code: $StatusCode (Unknown)"
+    }
+}
+
 function Get-TenantSignInData {
     <#
     .SYNOPSIS
@@ -2812,6 +2874,20 @@ function Get-TenantSignInData {
         [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData.csv")
     )
     
+    #═══════════════════════════════════════════════════════════
+    # IMPORT REQUIRED MODULE
+    #═══════════════════════════════════════════════════════════
+    
+    try {
+        Import-Module Microsoft.Graph.Reports -Force -ErrorAction Stop
+        Write-Log "Microsoft.Graph.Reports module imported successfully" -Level "Info"
+    }
+    catch {
+        Update-GuiStatus "Failed to import Microsoft.Graph.Reports module: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Failed to import Microsoft.Graph.Reports: $($_.Exception.Message)" -Level "Error"
+        throw "Microsoft.Graph.Reports module is required but could not be loaded. Please install it with: Install-Module Microsoft.Graph.Reports"
+    }
+    
     Update-GuiStatus "Starting sign-in data collection for the past $DaysBack days..." ([System.Drawing.Color]::Orange)
     Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
     Write-Log "SIGN-IN DATA COLLECTION STARTED" -Level "Info"
@@ -2831,47 +2907,41 @@ function Get-TenantSignInData {
         #═══════════════════════════════════════════════════════════
         
         Update-GuiStatus "Querying Microsoft Graph for sign-in logs..." ([System.Drawing.Color]::Orange)
+        Write-Log "Querying sign-in logs using Get-MgAuditLogSignIn cmdlet" -Level "Info"
         
         $signInLogs = @()
-        $pageSize = 1000
-        $pageCount = 0
         
-        # Build Graph API filter
-        $filter = "createdDateTime ge $filterDate"
-        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$filter&`$top=$pageSize&`$orderby=createdDateTime desc"
-        
-        do {
-            $pageCount++
-            Update-GuiStatus "Fetching sign-in page $pageCount..." ([System.Drawing.Color]::Orange)
+        try {
+            # Use the proper cmdlet instead of raw API calls
+            Update-GuiStatus "Retrieving sign-in logs (this may take a few minutes)..." ([System.Drawing.Color]::Orange)
             
-            try {
-                $response = Invoke-MgGraphRequest -Uri $uri -Method GET
-                
-                if ($response.value) {
-                    $signInLogs += $response.value
-                    Write-Log "Page $pageCount : Retrieved $($response.value.Count) sign-in records (Total: $($signInLogs.Count))" -Level "Info"
-                }
-                
-                $uri = $response.'@odata.nextLink'
-                
-                # Update status every page
-                if ($signInLogs.Count -gt 0) {
-                    Update-GuiStatus "Retrieved $($signInLogs.Count) sign-in records ($pageCount pages)..." ([System.Drawing.Color]::Orange)
-                }
+            $filter = "createdDateTime ge $filterDate"
+            Write-Log "Filter: $filter" -Level "Info"
+            
+            # Get all sign-ins with pagination handled automatically
+            $signInLogs = Get-MgAuditLogSignIn -Filter $filter -All -ErrorAction Stop
+            
+            Write-Log "Sign-in log query complete: $($signInLogs.Count) total records" -Level "Info"
+        }
+        catch {
+            Write-Log "Error fetching sign-in logs: $($_.Exception.Message)" -Level "Error"
+            
+            # Provide more detailed error information
+            if ($_.Exception.Message -match "Forbidden") {
+                Write-Log "Permission error - ensure you have AuditLog.Read.All permission and admin consent" -Level "Error"
+                Update-GuiStatus "Permission denied. Verify AuditLog.Read.All permission is granted." ([System.Drawing.Color]::Red)
             }
-            catch {
-                Write-Log "Error fetching sign-in page $pageCount : $($_.Exception.Message)" -Level "Error"
-                break
-            }
-        } while ($uri)
-        
-        Write-Log "Sign-in log query complete: $($signInLogs.Count) total records from $pageCount pages" -Level "Info"
+            
+            throw
+        }
         
         if ($signInLogs.Count -eq 0) {
             Update-GuiStatus "No sign-in data found for the specified date range" ([System.Drawing.Color]::Yellow)
             Write-Log "No sign-in data found" -Level "Warning"
             return @()
         }
+        
+        Update-GuiStatus "Retrieved $($signInLogs.Count) sign-in records" ([System.Drawing.Color]::Orange)
         
         #═══════════════════════════════════════════════════════════
         # EXTRACT AND DEDUPLICATE IP ADDRESSES
@@ -2880,8 +2950,8 @@ function Get-TenantSignInData {
         Update-GuiStatus "Extracting unique IP addresses..." ([System.Drawing.Color]::Orange)
         
         $uniqueIPs = $signInLogs | 
-            Where-Object { -not [string]::IsNullOrEmpty($_.ipAddress) } | 
-            Select-Object -ExpandProperty ipAddress -Unique
+            Where-Object { -not [string]::IsNullOrEmpty($_.IpAddress) } | 
+            Select-Object -ExpandProperty IpAddress -Unique
         
         Write-Log "Found $($uniqueIPs.Count) unique IP addresses (IPv4 and IPv6)" -Level "Info"
         
@@ -2939,11 +3009,11 @@ function Get-TenantSignInData {
             }
             
             # Extract basic sign-in info
-            $userId = $signIn.userPrincipalName
-            $userDisplayName = $signIn.userDisplayName
-            $creationTime = $signIn.createdDateTime
-            $userAgent = $signIn.userAgent
-            $ip = $signIn.ipAddress
+            $userId = $signIn.UserPrincipalName
+            $userDisplayName = $signIn.UserDisplayName
+            $creationTime = $signIn.CreatedDateTime
+            $userAgent = $signIn.UserAgent
+            $ip = $signIn.IpAddress
             
             # Initialize location defaults
             $isUnusual = $false
@@ -3029,6 +3099,10 @@ function Get-TenantSignInData {
                 }
             }
             
+            # Extract status code and get description
+            $statusCode = if ($signIn.Status) { $signIn.Status.ErrorCode } else { "0" }
+            $statusDescription = Get-SignInStatusDescription -StatusCode $statusCode
+            
             # Create result object
             $resultObject = [PSCustomObject]@{
                 UserId = $userId
@@ -3042,14 +3116,15 @@ function Get-TenantSignInData {
                 RegionName = $region
                 Country = $country
                 IsUnusualLocation = $isUnusual
-                Status = if ($signIn.status) { $signIn.status.errorCode } else { "0" }
-                FailureReason = if ($signIn.status) { $signIn.status.failureReason } else { "" }
-                ConditionalAccessStatus = $signIn.conditionalAccessStatus
-                RiskLevel = $signIn.riskLevelDuringSignIn
-                DeviceOS = if ($signIn.deviceDetail) { $signIn.deviceDetail.operatingSystem } else { "" }
-                DeviceBrowser = if ($signIn.deviceDetail) { $signIn.deviceDetail.browser } else { "" }
-                IsInteractive = $signIn.isInteractive
-                AppDisplayName = $signIn.appDisplayName
+                StatusCode = $statusCode
+                Status = $statusDescription
+                FailureReason = if ($signIn.Status) { $signIn.Status.FailureReason } else { "" }
+                ConditionalAccessStatus = $signIn.ConditionalAccessStatus
+                RiskLevel = $signIn.RiskLevelDuringSignIn
+                DeviceOS = if ($signIn.DeviceDetail) { $signIn.DeviceDetail.OperatingSystem } else { "" }
+                DeviceBrowser = if ($signIn.DeviceDetail) { $signIn.DeviceDetail.Browser } else { "" }
+                IsInteractive = $signIn.IsInteractive
+                AppDisplayName = $signIn.AppDisplayName
             }
             
             $results += $resultObject
@@ -3076,7 +3151,7 @@ function Get-TenantSignInData {
         }
         
         # Export failed sign-ins
-        $failedSignIns = $results | Where-Object { $_.Status -ne "0" -and ![string]::IsNullOrEmpty($_.Status) }
+        $failedSignIns = $results | Where-Object { $_.StatusCode -ne "0" -and ![string]::IsNullOrEmpty($_.StatusCode) }
         if ($failedSignIns.Count -gt 0) {
             $failedOutputPath = $OutputPath -replace '.csv$', '_Failed.csv'
             $failedSignIns | Export-Csv -Path $failedOutputPath -NoTypeInformation -Force
