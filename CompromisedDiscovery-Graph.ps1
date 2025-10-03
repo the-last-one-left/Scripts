@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "9.6"
+$ScriptVer = "9.7"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -7288,12 +7288,8 @@ function Generate-HTMLReport {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Microsoft 365 Security Analysis Report - Pacific Office</title>
     <style>
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* PACIFIC OFFICE THEME VARIABLES */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         :root {
-            /* Light Mode Colors - Update these with your exact brand colors */
             --primary-color: #0072BC;
             --secondary-color: #00A3E0;
             --accent-color: #FF9800;
@@ -7309,7 +7305,6 @@ function Generate-HTMLReport {
             --shadow: rgba(0, 0, 0, 0.1);
         }
         
-        /* Dark Mode Colors */
         body.dark-mode {
             --primary-color: #2196F3;
             --secondary-color: #42A5F5;
@@ -7325,10 +7320,6 @@ function Generate-HTMLReport {
             --border-color: #3C3C3C;
             --shadow: rgba(0, 0, 0, 0.3);
         }
-        
-        /* ═══════════════════════════════════════════════════════════════════ */
-        /* GLOBAL STYLES */
-        /* ═══════════════════════════════════════════════════════════════════ */
         
         * {
             margin: 0;
@@ -7355,10 +7346,7 @@ function Generate-HTMLReport {
             transition: background-color 0.3s ease;
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* HEADER */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .header {
             text-align: center;
             margin-bottom: 40px;
@@ -7412,10 +7400,7 @@ function Generate-HTMLReport {
             box-shadow: 0 6px 20px var(--shadow);
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* DASHBOARD STATISTICS */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -7437,21 +7422,10 @@ function Generate-HTMLReport {
             box-shadow: 0 8px 25px var(--shadow);
         }
         
-        .stat-box.critical {
-            border-left: 6px solid var(--critical-color);
-        }
-        
-        .stat-box.high {
-            border-left: 6px solid var(--danger-color);
-        }
-        
-        .stat-box.medium {
-            border-left: 6px solid var(--warning-color);
-        }
-        
-        .stat-box.low {
-            border-left: 6px solid var(--success-color);
-        }
+        .stat-box.critical { border-left: 6px solid var(--critical-color); }
+        .stat-box.high { border-left: 6px solid var(--danger-color); }
+        .stat-box.medium { border-left: 6px solid var(--warning-color); }
+        .stat-box.low { border-left: 6px solid var(--success-color); }
         
         .stat-number {
             font-size: 3em;
@@ -7470,10 +7444,7 @@ function Generate-HTMLReport {
             font-weight: 600;
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* USER CARDS */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .users-section {
             margin-top: 40px;
         }
@@ -7510,13 +7481,8 @@ function Generate-HTMLReport {
             background: linear-gradient(to right, rgba(244, 67, 54, 0.05), var(--surface-color));
         }
         
-        .user-card.medium {
-            border-left: 8px solid var(--warning-color);
-        }
-        
-        .user-card.low {
-            border-left: 8px solid var(--success-color);
-        }
+        .user-card.medium { border-left: 8px solid var(--warning-color); }
+        .user-card.low { border-left: 8px solid var(--success-color); }
         
         .user-header {
             display: flex;
@@ -7547,25 +7513,10 @@ function Generate-HTMLReport {
             letter-spacing: 1px;
         }
         
-        .risk-badge.critical {
-            background: var(--critical-color);
-            color: white;
-        }
-        
-        .risk-badge.high {
-            background: var(--danger-color);
-            color: white;
-        }
-        
-        .risk-badge.medium {
-            background: var(--warning-color);
-            color: white;
-        }
-        
-        .risk-badge.low {
-            background: var(--success-color);
-            color: white;
-        }
+        .risk-badge.critical { background: var(--critical-color); color: white; }
+        .risk-badge.high { background: var(--danger-color); color: white; }
+        .risk-badge.medium { background: var(--warning-color); color: white; }
+        .risk-badge.low { background: var(--success-color); color: white; }
         
         .risk-score {
             font-size: 2em;
@@ -7574,10 +7525,7 @@ function Generate-HTMLReport {
             margin: 10px 0;
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* COLLAPSIBLE SECTIONS */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .collapsible-content {
             display: none;
             margin-top: 20px;
@@ -7598,10 +7546,7 @@ function Generate-HTMLReport {
             transform: rotate(180deg);
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* TABLES */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .evidence-section {
             margin-top: 20px;
         }
@@ -7644,10 +7589,7 @@ function Generate-HTMLReport {
             background-color: var(--background-color);
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* BADGES & ALERTS */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         .badge {
             display: inline-block;
             padding: 4px 12px;
@@ -7687,10 +7629,13 @@ function Generate-HTMLReport {
             color: var(--primary-color);
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
-        /* FOOTER */
-        /* ═══════════════════════════════════════════════════════════════════ */
+        .alert.success {
+            background-color: rgba(76, 175, 80, 0.1);
+            border-color: var(--success-color);
+            color: var(--success-color);
+        }
         
+        /* FOOTER */
         .footer {
             margin-top: 60px;
             padding-top: 30px;
@@ -7704,20 +7649,14 @@ function Generate-HTMLReport {
             color: var(--primary-color);
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* PRINT STYLES */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         @media print {
             .dark-mode-toggle { display: none; }
             .collapsible-content { display: block !important; }
             .user-card { page-break-inside: avoid; }
         }
         
-        /* ═══════════════════════════════════════════════════════════════════ */
         /* RESPONSIVE DESIGN */
-        /* ═══════════════════════════════════════════════════════════════════ */
-        
         @media (max-width: 768px) {
             .stats-grid {
                 grid-template-columns: 1fr;
@@ -7735,7 +7674,6 @@ function Generate-HTMLReport {
     </style>
 </head>
 <body class="$( if ($defaultDarkMode -eq "true") { "dark-mode" } else { "" } )">
-    <!-- Dark Mode Toggle -->
     <div class="dark-mode-toggle">
         <button onclick="toggleDarkMode()" id="themeToggle">
             <span id="themeIcon">🌙</span> <span id="themeText">Dark Mode</span>
@@ -7743,7 +7681,6 @@ function Generate-HTMLReport {
     </div>
 
     <div class="container">
-        <!-- Header -->
         <div class="header">
             <h1>🛡️ Microsoft 365 Security Analysis Report</h1>
             <div class="subtitle">Pacific Office - Comprehensive Threat Detection & Risk Assessment</div>
@@ -7754,7 +7691,6 @@ function Generate-HTMLReport {
             </div>
         </div>
 
-        <!-- Executive Summary Dashboard -->
         <div class="stats-grid">
 "@
 
@@ -7763,7 +7699,6 @@ function Generate-HTMLReport {
     $highCount = ($Data | Where-Object { $_.RiskLevel -eq "High" }).Count
     $mediumCount = ($Data | Where-Object { $_.RiskLevel -eq "Medium" }).Count
     $lowCount = ($Data | Where-Object { $_.RiskLevel -eq "Low" }).Count
-    $totalUsers = $Data.Count
 
     $html += @"
             <div class="stat-box critical">
@@ -7783,8 +7718,6 @@ function Generate-HTMLReport {
                 <div class="stat-label">Low Risk</div>
             </div>
         </div>
-
-        <!-- Risk Distribution Alert -->
 "@
 
     if ($criticalCount -gt 0) {
@@ -7803,7 +7736,7 @@ function Generate-HTMLReport {
 "@
     }
 
-    # Sort users by risk level
+    # Sort users by risk
     $sortedData = $Data | Sort-Object @{Expression = {
         switch ($_.RiskLevel) {
             "Critical" { 1 }
@@ -7814,7 +7747,6 @@ function Generate-HTMLReport {
         }
     }}, RiskScore -Descending
 
-    # User Cards Section
     $html += @"
         <div class="users-section">
             <h2 class="section-title">📊 Detailed User Risk Analysis</h2>
@@ -7828,8 +7760,8 @@ function Generate-HTMLReport {
             <div class="user-card $riskClass">
                 <div class="user-header" onclick="toggleDetails(this)">
                     <div class="user-info">
-                        <h3>$($user.DisplayName)</h3>
-                        <div class="user-email">$($user.UserPrincipalName)</div>
+                        <h3>$([System.Web.HttpUtility]::HtmlEncode($user.UserDisplayName))</h3>
+                        <div class="user-email">$([System.Web.HttpUtility]::HtmlEncode($user.UserId))</div>
                     </div>
                     <div style="text-align: center;">
                         <div class="risk-badge $riskClass">$($user.RiskLevel) RISK</div>
@@ -7841,56 +7773,182 @@ function Generate-HTMLReport {
                 </div>
                 
                 <div class="collapsible-content $autoExpand">
-                    <!-- Risk Factors -->
+"@
+
+        # MFA Status
+        $mfaStatus = if ($user.MFAStatus) { $user.MFAStatus } else { "Unknown" }
+        if ($mfaStatus -eq "No") {
+            $html += @"
+                    <div class="alert critical">
+                        ❌ <strong>MFA Not Enabled</strong> - Account vulnerable to password attacks
+                    </div>
+"@
+        } elseif ($mfaStatus -eq "Yes") {
+            $html += @"
+                    <div class="alert success">
+                        ✅ <strong>MFA Enabled</strong>
+                    </div>
+"@
+        }
+
+        # Risk Summary Table
+        $html += @"
                     <div class="evidence-section">
-                        <h4>🎯 Risk Indicators</h4>
-                        <p><strong>Risk Factors:</strong> $($user.RiskReasons)</p>
-                        $(if ($user.HasMFA -ne "Yes") { "<div class='alert critical'>❌ <strong>MFA Not Enabled</strong> - Account vulnerable to password attacks</div>" } else { "<div class='alert info'>✅ <strong>MFA Enabled</strong></div>" })
-                        $(if ($user.IsAdmin -eq $true) { "<div class='alert warning'>👑 <strong>Administrative Account</strong> - Elevated privileges detected</div>" } else { "" })
+                        <h4>🎯 Risk Summary</h4>
+                        <table>
+                            <tr>
+                                <th>Risk Factor</th>
+                                <th>Count</th>
+                            </tr>
+"@
+        
+        if ($user.UnusualSignInCount -gt 0) {
+            $html += "<tr><td>Unusual Sign-In Locations</td><td><span class='badge warning'>$($user.UnusualSignInCount)</span></td></tr>"
+        }
+        if ($user.FailedSignInCount -gt 0) {
+            $html += "<tr><td>Failed Sign-In Attempts</td><td><span class='badge danger'>$($user.FailedSignInCount)</span></td></tr>"
+        }
+        if ($user.HighRiskOperationsCount -gt 0) {
+            $html += "<tr><td>High-Risk Admin Operations</td><td><span class='badge danger'>$($user.HighRiskOperationsCount)</span></td></tr>"
+        }
+        if ($user.SuspiciousRulesCount -gt 0) {
+            $html += "<tr><td>Suspicious Inbox Rules</td><td><span class='badge danger'>$($user.SuspiciousRulesCount)</span></td></tr>"
+        }
+        if ($user.SuspiciousDelegationsCount -gt 0) {
+            $html += "<tr><td>Suspicious Delegations</td><td><span class='badge warning'>$($user.SuspiciousDelegationsCount)</span></td></tr>"
+        }
+        if ($user.ETRSpamActivityCount -gt 0) {
+            $html += "<tr><td>Spam Activity Detected</td><td><span class='badge danger'>$($user.ETRSpamActivityCount)</span></td></tr>"
+        }
+        if ($user.FailedLoginPatternCount -gt 0) {
+            $html += "<tr><td>Failed Login Patterns</td><td><span class='badge danger'>$($user.FailedLoginPatternCount)</span></td></tr>"
+        }
+        if ($user.PasswordChangeIssuesCount -gt 0) {
+            $html += "<tr><td>Password Change Issues</td><td><span class='badge warning'>$($user.PasswordChangeIssuesCount)</span></td></tr>"
+        }
+        
+        $html += @"
+                        </table>
                     </div>
 "@
 
-        # Sign-in Analysis
-        if ($user.FailedLogins -gt 0 -or $user.SuccessfulLogins -gt 0) {
+        # Unusual Sign-Ins Details
+        if ($user.UnusualSignIns -and $user.UnusualSignIns.Count -gt 0) {
             $html += @"
                     <div class="evidence-section">
-                        <h4>🔐 Authentication Activity</h4>
+                        <h4>🌍 Unusual Sign-In Locations</h4>
                         <table>
                             <tr>
-                                <th>Successful Logins</th>
-                                <th>Failed Logins</th>
-                                <th>Unique IPs</th>
-                                <th>Unique Countries</th>
+                                <th>Date/Time</th>
+                                <th>Location</th>
+                                <th>IP Address</th>
+                                <th>ISP</th>
                             </tr>
+"@
+            foreach ($signIn in ($user.UnusualSignIns | Select-Object -First 10)) {
+                $location = "$($signIn.City), $($signIn.Country)"
+                $html += @"
                             <tr>
-                                <td><span class="badge success">$($user.SuccessfulLogins)</span></td>
-                                <td><span class="badge $(if($user.FailedLogins -gt 10){"danger"}elseif($user.FailedLogins -gt 5){"warning"}else{"info"})">$($user.FailedLogins)</span></td>
-                                <td>$($user.UniqueIPs)</td>
-                                <td>$($user.UniqueCountries)</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.CreationTime))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($location))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.IP))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.ISP))</td>
                             </tr>
+"@
+            }
+            $html += @"
                         </table>
                     </div>
 "@
         }
 
-        # Suspicious Activities
-        if ($user.SuspiciousActivities) {
+        # Failed Login Patterns
+        if ($user.FailedLoginPatterns -and $user.FailedLoginPatterns.Count -gt 0) {
             $html += @"
                     <div class="evidence-section">
-                        <h4>⚠️ Suspicious Activities Detected</h4>
-                        <div class="alert critical">
-                            $($user.SuspiciousActivities -replace "`n", "<br>")
-                        </div>
+                        <h4>🚨 Failed Login Attack Patterns</h4>
+                        <table>
+                            <tr>
+                                <th>Pattern Type</th>
+                                <th>Source IP</th>
+                                <th>Failed Attempts</th>
+                                <th>Risk Level</th>
+                            </tr>
+"@
+            foreach ($pattern in ($user.FailedLoginPatterns | Select-Object -First 5)) {
+                $html += @"
+                            <tr>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($pattern.PatternType))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($pattern.SourceIP))</td>
+                                <td><span class="badge danger">$($pattern.FailedAttempts)</span></td>
+                                <td><span class="badge $(if($pattern.RiskLevel -eq "Critical"){"danger"}else{"warning"})">$($pattern.RiskLevel)</span></td>
+                            </tr>
+"@
+            }
+            $html += @"
+                        </table>
                     </div>
 "@
         }
 
-        # Admin Roles
-        if ($user.AdminRoles) {
+        # Password Change Issues
+        if ($user.PasswordChangeIssues -and $user.PasswordChangeIssues.Count -gt 0) {
             $html += @"
                     <div class="evidence-section">
-                        <h4>👑 Administrative Roles</h4>
-                        <p>$($user.AdminRoles)</p>
+                        <h4>🔑 Suspicious Password Changes</h4>
+                        <table>
+                            <tr>
+                                <th>Change Count</th>
+                                <th>Time Span</th>
+                                <th>Off-Hours Changes</th>
+                                <th>Risk Level</th>
+                            </tr>
+"@
+            foreach ($pwChange in ($user.PasswordChangeIssues | Select-Object -First 5)) {
+                $html += @"
+                            <tr>
+                                <td><span class="badge warning">$($pwChange.ChangeCount)</span></td>
+                                <td>$($pwChange.TimeSpanHours) hours</td>
+                                <td>$($pwChange.OffHoursChanges)</td>
+                                <td><span class="badge $(if($pwChange.RiskLevel -eq "Critical"){"danger"}else{"warning"})">$($pwChange.RiskLevel)</span></td>
+                            </tr>
+"@
+            }
+            $html += @"
+                        </table>
+                    </div>
+"@
+        }
+
+        # Suspicious Rules
+        if ($user.SuspiciousRules -and $user.SuspiciousRules.Count -gt 0) {
+            $html += @"
+                    <div class="evidence-section">
+                        <h4>📨 Suspicious Inbox Rules</h4>
+                        <table>
+                            <tr>
+                                <th>Rule Name</th>
+                                <th>Actions</th>
+                                <th>Enabled</th>
+                            </tr>
+"@
+            foreach ($rule in ($user.SuspiciousRules | Select-Object -First 5)) {
+                $actions = @()
+                if ($rule.ForwardTo) { $actions += "Forwards Email" }
+                if ($rule.DeleteMessage -eq $true) { $actions += "Deletes" }
+                if ($rule.MarkAsRead -eq $true) { $actions += "Marks Read" }
+                $actionText = $actions -join ", "
+                
+                $html += @"
+                            <tr>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($rule.RuleName))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($actionText))</td>
+                                <td><span class="badge $(if($rule.Enabled -eq $true){"danger"}else{"info"})">$($rule.Enabled)</span></td>
+                            </tr>
+"@
+            }
+            $html += @"
+                        </table>
                     </div>
 "@
         }
@@ -7904,11 +7962,10 @@ function Generate-HTMLReport {
     $html += @"
         </div>
 
-        <!-- Footer -->
         <div class="footer">
             <strong>Pacific Office - Microsoft 365 Security Analysis Tool v$ScriptVer</strong><br>
             Report generated using Microsoft Graph PowerShell APIs<br>
-            Risk scores calculated based on multiple security indicators including authentication patterns, MFA status, administrative privileges, and suspicious activities<br>
+            Risk scores calculated based on multiple security indicators<br>
             <br>
             <strong>Recommended Actions:</strong><br>
             • Immediately review and remediate all Critical risk users<br>
@@ -7920,15 +7977,10 @@ function Generate-HTMLReport {
     </div>
 
     <script>
-        // ═══════════════════════════════════════════════════════════════════
-        // DARK MODE TOGGLE
-        // ═══════════════════════════════════════════════════════════════════
-        
         function toggleDarkMode() {
             const body = document.body;
             const isDark = body.classList.toggle('dark-mode');
             
-            // Update button text
             const icon = document.getElementById('themeIcon');
             const text = document.getElementById('themeText');
             
@@ -7940,11 +7992,9 @@ function Generate-HTMLReport {
                 text.textContent = 'Light Mode';
             }
             
-            // Save preference
             localStorage.setItem('darkMode', isDark);
         }
         
-        // Load saved theme preference (defaults to dark mode)
         window.addEventListener('DOMContentLoaded', function() {
             const savedMode = localStorage.getItem('darkMode');
             const isDark = savedMode === null ? $defaultDarkMode : savedMode === 'true';
@@ -7955,16 +8005,11 @@ function Generate-HTMLReport {
                 document.body.classList.remove('dark-mode');
             }
             
-            // Update button
             const icon = document.getElementById('themeIcon');
             const text = document.getElementById('themeText');
             icon.textContent = isDark ? '🌙' : '☀️';
             text.textContent = isDark ? 'Dark Mode' : 'Light Mode';
         });
-        
-        // ═══════════════════════════════════════════════════════════════════
-        // COLLAPSIBLE USER CARDS
-        // ═══════════════════════════════════════════════════════════════════
         
         function toggleDetails(header) {
             const content = header.nextElementSibling;
@@ -7974,7 +8019,6 @@ function Generate-HTMLReport {
             icon.classList.toggle('rotated');
         }
         
-        // Auto-expand critical and high risk users on load
         window.addEventListener('DOMContentLoaded', function() {
             const criticalAndHigh = document.querySelectorAll('.user-card.critical, .user-card.high');
             criticalAndHigh.forEach(card => {
