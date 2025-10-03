@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "8.5"
+$ScriptVer = "9.1"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -150,7 +150,8 @@ $ConfigData = @{
         "IdentityRiskyUser.Read.All",       # Read risky user information
         "Application.Read.All",             # Read application registrations
         "RoleManagement.Read.All",          # Read role assignments
-        "Policy.Read.All"                   # Read policies (Conditional Access, etc.)
+        "Policy.Read.All",                  # Read policies (Conditional Access, etc.)
+		"UserAuthenticationMethod.Read.All" # Read MFA Status
     )
     
     #───────────────────────────────────────────────────────────
@@ -773,6 +774,107 @@ function Get-Folder {
     }
 }
 
+function Test-IPAddress {
+    <#
+    .SYNOPSIS
+        Validates and categorizes IP addresses (IPv4 or IPv6)
+    
+    .DESCRIPTION
+        Tests if a string is a valid IP address and determines:
+        • IP version (IPv4 or IPv6)
+        • Whether it's private/internal
+        • Type of private address
+    
+    .PARAMETER IPAddress
+        IP address string to validate
+    
+    .OUTPUTS
+        PSCustomObject with validation results
+    #>
+    
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$IPAddress
+    )
+    
+    $result = [PSCustomObject]@{
+        IsValid = $false
+        IPVersion = $null
+        IsPrivate = $false
+        PrivateType = $null
+        ParsedIP = $null
+    }
+    
+    try {
+        $ipObj = [System.Net.IPAddress]::Parse($IPAddress)
+        $result.IsValid = $true
+        $result.ParsedIP = $ipObj
+        
+        if ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            $result.IPVersion = "IPv4"
+            
+            # Check IPv4 private ranges
+            if ($IPAddress -match "^10\.") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Class A Private (10.0.0.0/8)"
+            }
+            elseif ($IPAddress -match "^172\.(1[6-9]|2[0-9]|3[0-1])\.") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Class B Private (172.16.0.0/12)"
+            }
+            elseif ($IPAddress -match "^192\.168\.") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Class C Private (192.168.0.0/16)"
+            }
+            elseif ($IPAddress -match "^127\.") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Loopback (127.0.0.0/8)"
+            }
+            elseif ($IPAddress -match "^169\.254\.") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Link-Local (169.254.0.0/16)"
+            }
+        }
+        elseif ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $result.IPVersion = "IPv6"
+            $ipLower = $IPAddress.ToLower()
+            
+            # Check IPv6 special ranges
+            if ($ipLower -eq "::1") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Loopback (::1)"
+            }
+            elseif ($ipLower -match "^fe[89ab][0-9a-f]:") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Link-Local (fe80::/10)"
+            }
+            elseif ($ipLower -match "^f[cd][0-9a-f]{2}:") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Unique Local Address (fc00::/7)"
+            }
+            elseif ($ipLower -match "^fec[0-9a-f]:") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "Site-Local (deprecated, fec0::/10)"
+            }
+            elseif ($ipLower -match "^::ffff:") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "IPv4-Mapped (::ffff:0:0/96)"
+            }
+            elseif ($ipLower -match "^64:ff9b::") {
+                $result.IsPrivate = $true
+                $result.PrivateType = "IPv4/IPv6 Translation (64:ff9b::/96)"
+            }
+        }
+    }
+    catch {
+        # Invalid IP address
+        $result.IsValid = $false
+    }
+    
+    return $result
+}
+
 function Get-DateRangeInput {
     <#
     .SYNOPSIS
@@ -1081,110 +1183,55 @@ function Test-ScriptVersion {
 function Invoke-IPGeolocation {
     <#
     .SYNOPSIS
-        Performs IP geolocation lookup with caching and fallback.
+        Looks up geographic information for IPv4 or IPv6 addresses.
     
     .DESCRIPTION
-        Looks up geographic information for an IP address using a two-tier
-        approach with automatic failover and caching:
+        Performs geolocation lookup using a two-tier approach with IPv6 support:
         
         PRIMARY SERVICE: IPStack API
+        • Supports both IPv4 and IPv6
         • Requires API key (configured in $ConfigData)
         • More detailed information
-        • Rate limited based on subscription
         
         FALLBACK SERVICE: ip-api.com
-        • Free service, no API key required
+        • Free service supporting IPv4 and IPv6
         • Basic geographic information
-        • Rate limited to prevent abuse
         
         CACHING STRATEGY:
         • Results cached for 1 hour (configurable)
         • Reduces API calls significantly
-        • Improves performance for repeated lookups
         • Cache stored in provided hashtable
-        
-        RETRY LOGIC:
-        • Exponential backoff on failures
-        • Configurable retry attempts
-        • Automatic fallback to secondary service
-        
-        The function normalizes responses from both services to provide
-        a consistent data structure.
     
     .PARAMETER IPAddress
-        The IP address to look up. Should be a valid public IPv4 address.
-        Private/internal IPs will fail or return generic results.
-        Required parameter.
-    
+        IPv4 or IPv6 address to look up. Examples:
+        • IPv4: 8.8.8.8, 192.168.1.1
+        • IPv6: 2001:4860:4860::8888, ::1, fe80::1
+        
     .PARAMETER RetryCount
         Number of retry attempts for failed lookups on the primary service.
-        Retries use exponential backoff to avoid API rate limiting.
-        Valid range: 1-10
-        Default: 3
+        Valid range: 1-10, Default: 3
     
     .PARAMETER RetryDelay
-        Base delay in seconds between retry attempts. Actual delay uses
-        exponential backoff: delay = RetryDelay * (2 ^ attempt)
-        Valid range: 1-30 seconds
-        Default: 2 seconds
+        Base delay in seconds between retry attempts.
+        Valid range: 1-30 seconds, Default: 2 seconds
     
     .PARAMETER Cache
-        Hashtable for caching geolocation results. Each entry contains:
-        • Data     - The geolocation result object
-        • CachedAt - Timestamp when cached
-        
-        The cache is checked first before making any API calls.
-        Results older than CacheTimeout are automatically removed.
+        Hashtable for caching geolocation results.
         Required parameter (pass empty hashtable if not using cache).
     
     .OUTPUTS
-        PSCustomObject with the following properties:
-        • ip           - The queried IP address
-        • city         - City name (or "Unknown")
-        • region_name  - State/region name (or "Unknown")
-        • country_name - Country name (or "Unknown")
-        • connection   - Object with ISP information
-          └─ isp       - Internet Service Provider name
-        • fallback_source - Present if fallback service was used
-    
-    .EXAMPLE
-        # Basic usage with cache
-        $cache = @{}
-        $location = Invoke-IPGeolocation -IPAddress "8.8.8.8" -Cache $cache
-        Write-Host "Location: $($location.city), $($location.country_name)"
-        Write-Host "ISP: $($location.connection.isp)"
-    
-    .EXAMPLE
-        # Process multiple IPs with shared cache
-        $ipCache = @{}
-        $ips = @("8.8.8.8", "1.1.1.1", "208.67.222.222")
-        foreach ($ip in $ips) {
-            $loc = Invoke-IPGeolocation -IPAddress $ip -Cache $ipCache
-            Write-Host "$ip : $($loc.city), $($loc.country_name)"
-        }
-    
-    .EXAMPLE
-        # Custom retry configuration for unreliable network
-        $result = Invoke-IPGeolocation -IPAddress "1.1.1.1" `
-                                        -RetryCount 5 `
-                                        -RetryDelay 3 `
-                                        -Cache @{}
+        PSCustomObject with geolocation data
     
     .NOTES
-        - Requires internet connection to geolocation services
-        - IPStack API key must be configured in $ConfigData
-        - Free tier IPStack has monthly request limits
-        - Fallback service (ip-api.com) has rate limiting
-        - Private IPs (10.x, 192.168.x, etc.) may return generic data
-        - Cache significantly improves performance for repeated lookups
-        - Thread-safe if each thread uses its own cache hashtable
+        • Supports both IPv4 and IPv6 addresses
+        • Private/internal IPs return generic data
+        • IPv6 loopback (::1) and link-local (fe80::) are detected
     #>
     
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true, Position = 0)]
         [ValidateNotNullOrEmpty()]
-        [ValidatePattern('^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')]  # Basic IPv4 validation
         [string]$IPAddress,
         
         [Parameter(Mandatory = $false)]
@@ -1199,152 +1246,230 @@ function Invoke-IPGeolocation {
         [hashtable]$Cache
     )
     
-    #──────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # VALIDATE IP ADDRESS (IPv4 or IPv6)
+    # ═══════════════════════════════════════════════════════════
+    
+    $isIPv4 = $false
+    $isIPv6 = $false
+    
+    # Try to parse as IP address
+    try {
+        $ipObj = [System.Net.IPAddress]::Parse($IPAddress)
+        
+        if ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            $isIPv4 = $true
+        }
+        elseif ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            $isIPv6 = $true
+        }
+    }
+    catch {
+        Write-Log "Invalid IP address format: $IPAddress" -Level "Warning"
+        return @{
+            ip           = $IPAddress
+            city         = "Invalid IP"
+            region_name  = "Invalid IP"
+            country_name = "Invalid IP"
+            connection   = @{ isp = "Invalid IP" }
+        }
+    }
+    
+    # ═══════════════════════════════════════════════════════════
     # CHECK CACHE FIRST
-    #──────────────────────────────────────────────────────────
-    # If we have a cached result that's still valid, return it immediately
-    # This dramatically reduces API calls and improves performance
+    # ═══════════════════════════════════════════════════════════
     
     if ($Cache.ContainsKey($IPAddress)) {
-        $cachedResult = $Cache[$IPAddress]
-        $cacheAge = (Get-Date) - $cachedResult.CachedAt
+        $cachedEntry = $Cache[$IPAddress]
+        $cacheAge = (Get-Date) - $cachedEntry.CachedAt
         
-        # Check if cache is still valid (not expired)
-        if ($cacheAge -lt [TimeSpan]::FromSeconds($ConfigData.CacheTimeout)) {
-            Write-Log "Using cached geolocation for $IPAddress (age: $([math]::Round($cacheAge.TotalMinutes, 1)) minutes)" -Level "Info"
-            return $cachedResult.Data
+        if ($cacheAge.TotalSeconds -lt $ConfigData.CacheTimeout) {
+            return $cachedEntry.Data
         }
         else {
-            # Cache expired, remove entry
-            Write-Log "Cache expired for $IPAddress, fetching fresh data" -Level "Info"
             $Cache.Remove($IPAddress)
         }
     }
     
-    #──────────────────────────────────────────────────────────
-    # PRIMARY SERVICE: IPSTACK
-    #──────────────────────────────────────────────────────────
-    # Try IPStack API first (primary service with API key)
+    # ═══════════════════════════════════════════════════════════
+    # CHECK FOR PRIVATE/SPECIAL IP ADDRESSES
+    # ═══════════════════════════════════════════════════════════
     
-    # Decode API key from Base64
-    $apiKey = [System.Text.Encoding]::UTF8.GetString(
-        [System.Convert]::FromBase64String($ConfigData.IPStackAPIKey)
-    )
+    $isPrivate = $false
+    $privateType = ""
     
-    for ($i = 0; $i -lt $RetryCount; $i++) {
-        try {
-            # Add small random delay to avoid rate limiting when processing multiple IPs
-            Start-Sleep -Milliseconds (Get-Random -Minimum 100 -Maximum 500)
-            
-            # Build IPStack API URL
-            $url = "http://api.ipstack.com/{0}?access_key={1}" -f $IPAddress, $apiKey
-            
-            # Make API request with timeout
-            $result = Invoke-RestMethod -Method Get `
-                                        -Uri $url `
-                                        -TimeoutSec 30 `
-                                        -ErrorAction Stop
-            
-            # Check if IPStack returned an error
-            if ($result.error) {
-                $errorType = $result.error.type
-                $errorInfo = $result.error.info
-                Write-Log "IPStack error for ${IPAddress}: $errorType - $errorInfo" -Level "Warning"
-                throw "IPStack API error: $errorType"
-            }
-            
-            # Success! Cache the result
-            $Cache[$IPAddress] = @{
-                Data     = $result
-                CachedAt = Get-Date
-            }
-            
-            Write-Log "Successfully geolocated $IPAddress using IPStack" -Level "Info"
-            return $result
+    if ($isIPv4) {
+        # IPv4 private ranges
+        if ($IPAddress -match "^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\.|^127\.") {
+            $isPrivate = $true
+            $privateType = "Private/Internal IPv4"
         }
-        catch {
-            Write-Log "IPStack attempt $($i+1)/$RetryCount failed for ${IPAddress}: $($_.Exception.Message)" -Level "Warning"
-            
-            # Exponential backoff between retries
-            # Wait longer after each failure: 2s, 4s, 8s, etc.
-            if ($i -lt $RetryCount - 1) {
-                $waitTime = [math]::Pow(2, $i) * $RetryDelay
-                Write-Log "Waiting $waitTime seconds before retry..." -Level "Info"
-                Start-Sleep -Seconds $waitTime
-            }
+        elseif ($IPAddress -match "^169\.254\.") {
+            $isPrivate = $true
+            $privateType = "Link-Local IPv4"
+        }
+    }
+    elseif ($isIPv6) {
+        # IPv6 special ranges
+        $ipv6Lower = $IPAddress.ToLower()
+        
+        # Loopback ::1
+        if ($ipv6Lower -eq "::1") {
+            $isPrivate = $true
+            $privateType = "Loopback IPv6"
+        }
+        # Link-local fe80::/10
+        elseif ($ipv6Lower -match "^fe[89ab][0-9a-f]:") {
+            $isPrivate = $true
+            $privateType = "Link-Local IPv6"
+        }
+        # Unique local addresses fc00::/7 (fd00::/8 is most common)
+        elseif ($ipv6Lower -match "^f[cd][0-9a-f]{2}:") {
+            $isPrivate = $true
+            $privateType = "Private IPv6 (ULA)"
+        }
+        # Site-local (deprecated but still seen) fec0::/10
+        elseif ($ipv6Lower -match "^fec[0-9a-f]:") {
+            $isPrivate = $true
+            $privateType = "Site-Local IPv6 (deprecated)"
+        }
+        # IPv4-mapped IPv6 addresses ::ffff:0:0/96
+        elseif ($ipv6Lower -match "^::ffff:") {
+            $isPrivate = $true
+            $privateType = "IPv4-mapped IPv6"
         }
     }
     
-    #──────────────────────────────────────────────────────────
-    # FALLBACK SERVICE: IP-API.COM
-    #──────────────────────────────────────────────────────────
-    # IPStack failed, try fallback service (free, no key required)
-    
-    Write-Log "IPStack failed for $IPAddress, trying fallback service (ip-api.com)" -Level "Warning"
-    
-    try {
-        # Rate limiting delay for free service
-        Start-Sleep -Milliseconds 500
-        
-        # Build fallback API URL with required fields
-        $fallbackUrl = "http://ip-api.com/json/{0}?fields=status,message,country,countryCode,region,regionName,city,lat,lon,isp,org,as,query" -f $IPAddress
-        
-        # Make request to fallback service
-        $fallbackResult = Invoke-RestMethod -Method Get `
-                                           -Uri $fallbackUrl `
-                                           -TimeoutSec 30 `
-                                           -ErrorAction Stop
-        
-        # Check if request was successful
-        if ($fallbackResult.status -ne "success") {
-            throw "Fallback API error: $($fallbackResult.message)"
+    if ($isPrivate) {
+        $privateResult = @{
+            ip           = $IPAddress
+            city         = $privateType
+            region_name  = "Private Network"
+            country_name = "Private Network"
+            connection   = @{ isp = "Internal" }
+            ip_version   = if ($isIPv4) { "IPv4" } else { "IPv6" }
+            is_private   = $true
         }
         
-        # Convert fallback format to match IPStack format for consistency
-        # This ensures calling code gets same structure regardless of source
-        $normalizedResult = [PSCustomObject]@{
-            ip              = $fallbackResult.query
-            city            = $fallbackResult.city
-            region_name     = $fallbackResult.regionName
-            country_name    = $fallbackResult.country
-            connection      = @{ 
-                isp = if ($fallbackResult.isp) { $fallbackResult.isp } 
-                      elseif ($fallbackResult.org) { $fallbackResult.org } 
-                      else { "Unknown" }
-            }
-            fallback_source = "ip-api.com"  # Mark that fallback was used
-        }
-        
-        # Cache the fallback result
         $Cache[$IPAddress] = @{
-            Data     = $normalizedResult
+            Data     = $privateResult
             CachedAt = Get-Date
         }
         
-        Write-Log "Successfully geolocated $IPAddress using fallback service (ip-api.com)" -Level "Info"
-        return $normalizedResult
-    }
-    catch {
-        Write-Log "Fallback geolocation also failed for ${IPAddress}: $($_.Exception.Message)" -Level "Error"
+        return $privateResult
     }
     
-    #──────────────────────────────────────────────────────────
-    # ALL SERVICES FAILED
-    #──────────────────────────────────────────────────────────
-    # Return blank object to avoid null reference errors in calling code
+    # ═══════════════════════════════════════════════════════════
+    # ATTEMPT GEOLOCATION LOOKUP
+    # ═══════════════════════════════════════════════════════════
     
-    Write-Log "All geolocation services failed for IP $IPAddress" -Level "Error"
+    $attempt = 0
+    $success = $false
+    $result = $null
     
-    $failureResult = [PSCustomObject]@{
+    # Try primary service (IPStack) with retries
+    while ($attempt -lt $RetryCount -and -not $success) {
+        $attempt++
+        
+        try {
+            $apiKey = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ConfigData.IPStackAPIKey))
+            $uri = "http://api.ipstack.com/${IPAddress}?access_key=${apiKey}&output=json"
+            
+            $response = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 10 -ErrorAction Stop
+            
+            if ($response -and $response.ip) {
+                $result = @{
+                    ip           = $response.ip
+                    city         = if ($response.city) { $response.city } else { "Unknown" }
+                    region_name  = if ($response.region_name) { $response.region_name } else { "Unknown" }
+                    country_name = if ($response.country_name) { $response.country_name } else { "Unknown" }
+                    connection   = @{ 
+                        isp = if ($response.connection -and $response.connection.isp) { 
+                            $response.connection.isp 
+                        } else { 
+                            "Unknown" 
+                        }
+                    }
+                    ip_version   = if ($isIPv4) { "IPv4" } else { "IPv6" }
+                    latitude     = $response.latitude
+                    longitude    = $response.longitude
+                    is_private   = $false
+                }
+                
+                $success = $true
+                
+                $Cache[$IPAddress] = @{
+                    Data     = $result
+                    CachedAt = Get-Date
+                }
+                
+                return $result
+            }
+        }
+        catch {
+            if ($attempt -lt $RetryCount) {
+                $delay = $RetryDelay * [Math]::Pow(2, $attempt - 1)
+                Start-Sleep -Seconds $delay
+            }
+        }
+    }
+    
+    # ═══════════════════════════════════════════════════════════
+    # FALLBACK SERVICE (ip-api.com)
+    # ═══════════════════════════════════════════════════════════
+    
+    if (-not $success) {
+        try {
+            # ip-api.com supports both IPv4 and IPv6
+            $uri = "http://ip-api.com/json/${IPAddress}"
+            
+            $response = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 10 -ErrorAction Stop
+            
+            if ($response -and $response.status -eq "success") {
+                $result = @{
+                    ip           = $response.query
+                    city         = if ($response.city) { $response.city } else { "Unknown" }
+                    region_name  = if ($response.regionName) { $response.regionName } else { "Unknown" }
+                    country_name = if ($response.country) { $response.country } else { "Unknown" }
+                    connection   = @{ 
+                        isp = if ($response.isp) { $response.isp } else { "Unknown" }
+                    }
+                    ip_version   = if ($isIPv4) { "IPv4" } else { "IPv6" }
+                    latitude     = $response.lat
+                    longitude    = $response.lon
+                    fallback_source = "ip-api.com"
+                    is_private   = $false
+                }
+                
+                $success = $true
+                
+                $Cache[$IPAddress] = @{
+                    Data     = $result
+                    CachedAt = Get-Date
+                }
+                
+                return $result
+            }
+        }
+        catch {
+            Write-Log "Fallback geolocation service also failed for $IPAddress : $($_.Exception.Message)" -Level "Warning"
+        }
+    }
+    
+    # ═══════════════════════════════════════════════════════════
+    # ALL ATTEMPTS FAILED - RETURN FAILURE RESULT
+    # ═══════════════════════════════════════════════════════════
+    
+    $failureResult = @{
         ip           = $IPAddress
         city         = "Unknown"
         region_name  = "Unknown"
         country_name = "Unknown"
         connection   = @{ isp = "Unknown" }
+        ip_version   = if ($isIPv4) { "IPv4" } else { "IPv6" }
+        is_private   = $false
     }
     
-    # Cache the failure result to avoid repeated failed lookups
-    # This prevents hammering services with IPs that consistently fail
     $Cache[$IPAddress] = @{
         Data     = $failureResult
         CachedAt = Get-Date
@@ -1355,29 +1480,6 @@ function Invoke-IPGeolocation {
 
 #endregion
 
-#################################################################
-#
-#  Microsoft 365 Security Analysis Tool - Enhanced Edition
-#  
-#  [Previous header content preserved - not repeated for brevity]
-#
-#################################################################
-
-#region SCRIPT CONFIGURATION AND INITIALIZATION
-# [Previous configuration section preserved - not repeated]
-#endregion
-
-#region CORE HELPER FUNCTIONS
-# [Previous helper functions preserved - not repeated]
-#endregion
-
-#region VERSION CHECKING AND UPDATE MANAGEMENT
-# [Previous version checking section preserved - not repeated]
-#endregion
-
-#region IP GEOLOCATION SERVICES
-# [Previous IP geolocation section preserved - not repeated]
-#endregion
 
 #region CONNECTION MANAGEMENT
 
@@ -2660,377 +2762,153 @@ function Get-TenantSignInData {
         • Queries Microsoft Graph sign-in logs
         • Retrieves user authentication activity
         • Handles pagination for large datasets
-        • Implements automatic fallback to Exchange Online if Graph API blocked
+        • Supports both IPv4 and IPv6 addresses
         
         GEOLOCATION ENRICHMENT:
-        • Identifies unique IP addresses from sign-ins
+        • Identifies unique IP addresses (IPv4 and IPv6) from sign-ins
         • Performs geolocation lookup with caching
         • Determines unusual locations based on configured countries
         • Adds ISP and geographic information to records
         
-        SECURITY DEFAULTS HANDLING:
-        • Detects if Security Defaults are enabled
-        • Offers fallback to Exchange Online Unified Audit Log
-        • Provides user choice between methods
+        IPv6 SUPPORT:
+        • Detects and handles IPv6 addresses
+        • Identifies IPv6 private/special ranges
+        • Performs geolocation on public IPv6 addresses
         
         OUTPUT FILES:
         • UserLocationData.csv - All sign-in records with geolocation
         • UserLocationData_Unusual.csv - Sign-ins from unexpected countries
         • UserLocationData_Failed.csv - Failed authentication attempts
         • UniqueSignInLocations.csv - Unique IP/location combinations per user
-        
-        PERFORMANCE OPTIMIZATIONS:
-        • IP caching reduces geolocation API calls
-        • Batch processing for large datasets
-        • Progressive result filtering
-        • Efficient pagination handling
     
     .PARAMETER DaysBack
         Number of days to look back for sign-in data.
         Valid range: 1-365 days
         Default: Value from $ConfigData.DateRange
-        
-        Note: Larger values significantly increase processing time
     
     .PARAMETER OutputPath
         Full path where the CSV output file will be saved.
         Default: WorkDir\UserLocationData.csv
-        
-        Additional filtered files will be created in the same directory
     
     .OUTPUTS
-        Array of PSCustomObject containing sign-in records with properties:
-        • UserId              - User principal name
-        • UserDisplayName     - User's display name
-        • CreationTime        - Sign-in timestamp
-        • UserAgent           - Browser/client information
-        • IP                  - Source IP address
-        • ISP                 - Internet Service Provider
-        • City                - Geographic city
-        • RegionName          - State/province
-        • Country             - Country name
-        • IsUnusualLocation   - Boolean flag for unexpected country
-        • Status              - Authentication status code
-        • FailureReason       - Reason if authentication failed
-        • ConditionalAccessStatus - CA policy result
-        • RiskLevel           - Risk assessment from Azure AD
-        • DeviceOS            - Operating system
-        • DeviceBrowser       - Browser name
-        • IsInteractive       - Interactive vs non-interactive login
-        • AppDisplayName      - Application accessed
+        Array of PSCustomObject containing sign-in records with geolocation
     
     .EXAMPLE
-        # Collect 30 days of sign-in data
-        $signIns = Get-TenantSignInData -DaysBack 30
-        Write-Host "Collected $($signIns.Count) sign-in records"
-    
-    .EXAMPLE
-        # Collect data to custom location
-        $customPath = "D:\Audit\SignIns_$(Get-Date -Format 'yyyyMMdd').csv"
-        Get-TenantSignInData -OutputPath $customPath
-    
-    .EXAMPLE
-        # Standard collection with default settings
-        Get-TenantSignInData
+        Get-TenantSignInData -DaysBack 30
     
     .NOTES
         - Requires AuditLog.Read.All permission
-        - Security Defaults may block Graph API access
+        - Supports both IPv4 and IPv6 addresses
         - Geolocation requires internet connectivity
-        - Large date ranges may take significant time
-        - Progress updates provided through GUI
-        - Safe to interrupt and restart
     #>
     
     [CmdletBinding()]
-    [OutputType([System.Object[]])]
     param (
         [Parameter(Mandatory = $false)]
         [ValidateRange(1, 365)]
         [int]$DaysBack = $ConfigData.DateRange,
         
         [Parameter(Mandatory = $false)]
-        [ValidateNotNullOrEmpty()]
         [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData.csv")
     )
     
     Update-GuiStatus "Starting sign-in data collection for the past $DaysBack days..." ([System.Drawing.Color]::Orange)
-    Write-Log "═══════════════════════════════════════════════════" -Level "Info"
+    Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
     Write-Log "SIGN-IN DATA COLLECTION STARTED" -Level "Info"
     Write-Log "Date Range: $DaysBack days" -Level "Info"
-    Write-Log "Output Path: $OutputPath" -Level "Info"
-    Write-Log "═══════════════════════════════════════════════════" -Level "Info"
-    
-    #──────────────────────────────────────────────────────────
-    # CHECK SECURITY DEFAULTS
-    #──────────────────────────────────────────────────────────
-    $securityDefaultsStatus = Test-SecurityDefaults
-    
-    #──────────────────────────────────────────────────────────
-    # FORMAT DATE RANGE FOR GRAPH API
-    #──────────────────────────────────────────────────────────
-    # Microsoft Graph requires ISO 8601 format with UTC timezone
-    $startDate = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $endDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    
-    Write-Log "Query range: $startDate to $endDate (UTC)" -Level "Info"
+    Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
     
     try {
-        #──────────────────────────────────────────────────────
-        # TEST SIGN-IN LOG ACCESS
-        #──────────────────────────────────────────────────────
-        Update-GuiStatus "Testing sign-in log access..." ([System.Drawing.Color]::Orange)
+        # Calculate date range
+        $startDate = (Get-Date).AddDays(-$DaysBack)
+        $filterDate = $startDate.ToString("yyyy-MM-ddTHH:mm:ssZ")
         
-        $permissionTestPassed = $false
-        $shouldTryExchangeFallback = $false
+        # Initialize IP cache for geolocation
+        $ipCache = @{}
         
-        # If security defaults enabled, warn and prepare for fallback
-        if ($securityDefaultsStatus.IsEnabled -eq $true) {
-            Update-GuiStatus "Security defaults enabled - sign-in logs may be restricted" ([System.Drawing.Color]::Orange)
-            Write-Log "Security Defaults detected - may need Exchange Online fallback" -Level "Warning"
-            
-            $fallbackChoice = [System.Windows.Forms.MessageBox]::Show(
-                "Security Defaults Detected`n`n" +
-                "Microsoft 365 Security Defaults are enabled in this tenant.`n" +
-                "This typically blocks access to sign-in logs via Microsoft Graph API.`n`n" +
-                "Options:`n" +
-                "• Yes: Try Graph API first, use Exchange Online fallback if it fails`n" +
-                "• No: Skip Graph API and use Exchange Online directly`n" +
-                "• Cancel: Skip sign-in data collection`n`n" +
-                "Recommendation: Choose 'No' to save time and use Exchange Online directly.",
-                "Security Defaults - Choose Collection Method",
-                "YesNoCancel",
-                "Warning"
-            )
-            
-            switch ($fallbackChoice) {
-                "Yes" { 
-                    Write-Log "User chose to try Graph API first with fallback" -Level "Info"
-                    $shouldTryExchangeFallback = $true
-                }
-                "No" { 
-                    Write-Log "User chose to skip Graph API and use Exchange Online directly" -Level "Info"
-                    Update-GuiStatus "Using Exchange Online for sign-in data collection..." ([System.Drawing.Color]::Orange)
-                    return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
-                }
-                "Cancel" {
-                    Write-Log "User cancelled sign-in data collection" -Level "Info"
-                    Update-GuiStatus "Sign-in data collection cancelled by user" ([System.Drawing.Color]::Orange)
-                    return $null
-                }
-            }
-        }
+        #═══════════════════════════════════════════════════════════
+        # QUERY SIGN-IN LOGS FROM MICROSOFT GRAPH
+        #═══════════════════════════════════════════════════════════
         
-        #──────────────────────────────────────────────────────
-        # TRY MULTIPLE ACCESS METHODS
-        #──────────────────────────────────────────────────────
-        $testApproaches = @(
-            @{
-                Name = "Basic signIns endpoint"
-                Uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=1"
-                Headers = @{}
-            },
-            @{
-                Name = "signIns with eventual consistency"
-                Uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=1"
-                Headers = @{'ConsistencyLevel' = 'eventual'}
-            }
-        )
-        
-        foreach ($approach in $testApproaches) {
-            try {
-                Write-Log "Testing approach: $($approach.Name)" -Level "Info"
-                $testResponse = Invoke-MgGraphRequest -Uri $approach.Uri -Method GET -Headers $approach.Headers -ErrorAction Stop
-                Write-Log "✓ Sign-in log access verified with: $($approach.Name)" -Level "Info"
-                $permissionTestPassed = $true
-                break
-            }
-            catch {
-                $errorMessage = $_.Exception.Message
-                Write-Log "✗ Approach '$($approach.Name)' failed: $errorMessage" -Level "Warning"
-                
-                # Check for security defaults specific errors
-                if ($errorMessage -like "*security defaults*" -or $errorMessage -like "*Conditional Access*") {
-                    Write-Log "Security defaults or Conditional Access blocking Graph API access" -Level "Error"
-                    $shouldTryExchangeFallback = $true
-                    break
-                }
-            }
-        }
-        
-        #──────────────────────────────────────────────────────
-        # HANDLE ACCESS FAILURE
-        #──────────────────────────────────────────────────────
-        if (-not $permissionTestPassed) {
-            if ($shouldTryExchangeFallback -or $securityDefaultsStatus.IsEnabled -eq $true) {
-                Write-Log "Graph API failed, attempting Exchange Online fallback" -Level "Warning"
-                Update-GuiStatus "Graph API blocked - switching to Exchange Online fallback..." ([System.Drawing.Color]::Orange)
-                
-                [System.Windows.Forms.MessageBox]::Show(
-                    "Microsoft Graph API Blocked`n`n" +
-                    "Sign-in log access via Graph API failed (likely due to Security Defaults).`n`n" +
-                    "Switching to Exchange Online fallback method.`n" +
-                    "This will collect sign-in information from Exchange audit logs.",
-                    "Using Fallback Method",
-                    "OK",
-                    "Information"
-                )
-                
-                return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
-            }
-            else {
-                Write-Log "All permission test approaches failed" -Level "Error"
-                
-                $shouldProceed = [System.Windows.Forms.MessageBox]::Show(
-                    "Sign-in Log Access Test Failed`n`n" +
-                    "The permission test failed. This might be due to:`n" +
-                    "• Insufficient permissions`n" +
-                    "• Security defaults blocking access`n" +
-                    "• Tenant configuration restrictions`n`n" +
-                    "Options:`n" +
-                    "• Yes: Try Exchange Online fallback method`n" +
-                    "• No: Skip sign-in data collection",
-                    "Permission Test Failed - Use Fallback?",
-                    "YesNo",
-                    "Warning"
-                )
-                
-                if ($shouldProceed -eq "Yes") {
-                    return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
-                }
-                else {
-                    Update-GuiStatus "Sign-in data collection skipped by user choice" ([System.Drawing.Color]::Orange)
-                    return $null
-                }
-            }
-        }
-        
-        #──────────────────────────────────────────────────────
-        # QUERY SIGN-IN LOGS FROM GRAPH API
-        #──────────────────────────────────────────────────────
         Update-GuiStatus "Querying Microsoft Graph for sign-in logs..." ([System.Drawing.Color]::Orange)
-        Write-Log "Starting sign-in log query via Graph API" -Level "Info"
         
         $signInLogs = @()
         $pageSize = 1000
         $pageCount = 0
         
-        # Select only essential fields to reduce payload size
-        $selectFields = @(
-            "userPrincipalName",
-            "userDisplayName", 
-            "createdDateTime",
-            "ipAddress",
-            "status",
-            "appDisplayName",
-            "isInteractive",
-            "conditionalAccessStatus",
-            "riskLevelDuringSignIn"
-        ) -join ","
+        # Build Graph API filter
+        $filter = "createdDateTime ge $filterDate"
+        $uri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$filter&`$top=$pageSize&`$orderby=createdDateTime desc"
         
-        # Build filter query
-        $filterQuery = "createdDateTime ge $startDate"
-        
-        # Build query parameters
-        $queryParams = @()
-        $queryParams += "`$filter=$filterQuery"
-        $queryParams += "`$top=$pageSize"
-        $queryParams += "`$select=$selectFields"
-        
-        $fullUri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?" + ($queryParams -join "&")
-        $nextLink = $fullUri
-        
-        Write-Log "Initial query URI: $fullUri" -Level "Info"
-        
-        #──────────────────────────────────────────────────────
-        # PAGINATION LOOP
-        #──────────────────────────────────────────────────────
         do {
             $pageCount++
-            Update-GuiStatus "Fetching page $pageCount of sign-in data..." ([System.Drawing.Color]::Orange)
+            Update-GuiStatus "Fetching sign-in page $pageCount..." ([System.Drawing.Color]::Orange)
             
             try {
-                $response = Invoke-MgGraphRequest -Uri $nextLink -Method GET -Headers @{'ConsistencyLevel' = 'eventual'} -ErrorAction Stop
+                $response = Invoke-MgGraphRequest -Uri $uri -Method GET
                 
-                $signInLogs += $response.value
-                $nextLink = $response.'@odata.nextLink'
+                if ($response.value) {
+                    $signInLogs += $response.value
+                    Write-Log "Page $pageCount : Retrieved $($response.value.Count) sign-in records (Total: $($signInLogs.Count))" -Level "Info"
+                }
                 
-                Write-Log "Page $pageCount retrieved: $($response.value.Count) records (Total: $($signInLogs.Count))" -Level "Info"
+                $uri = $response.'@odata.nextLink'
                 
-                # Progress update every 3 pages
-                if ($pageCount % 3 -eq 0) {
-                    Update-GuiStatus "Retrieved $($signInLogs.Count) sign-in records from $pageCount pages..." ([System.Drawing.Color]::Orange)
+                # Update status every page
+                if ($signInLogs.Count -gt 0) {
+                    Update-GuiStatus "Retrieved $($signInLogs.Count) sign-in records ($pageCount pages)..." ([System.Drawing.Color]::Orange)
                 }
             }
             catch {
-                Write-Log "Error on page ${pageCount}: $($_.Exception.Message)" -Level "Error"
-                throw
+                Write-Log "Error fetching sign-in page $pageCount : $($_.Exception.Message)" -Level "Error"
+                break
             }
-        } while ($nextLink -and $pageCount -lt 50)  # Safety limit
+        } while ($uri)
+        
+        Write-Log "Sign-in log query complete: $($signInLogs.Count) total records from $pageCount pages" -Level "Info"
         
         if ($signInLogs.Count -eq 0) {
-            Write-Log "No sign-in logs retrieved" -Level "Warning"
-            Update-GuiStatus "No sign-in data found for the specified date range" ([System.Drawing.Color]::Orange)
-            
-            [System.Windows.Forms.MessageBox]::Show(
-                "No sign-in data found.`n`n" +
-                "This could be due to:`n" +
-                "• No sign-in activity in the specified timeframe`n" +
-                "• Insufficient permissions`n" +
-                "• Tenant audit log configuration`n`n" +
-                "Please verify your permissions and try again.",
-                "No Data Found",
-                "OK",
-                "Warning"
-            )
-            return $null
+            Update-GuiStatus "No sign-in data found for the specified date range" ([System.Drawing.Color]::Yellow)
+            Write-Log "No sign-in data found" -Level "Warning"
+            return @()
         }
         
-        Write-Log "Retrieved $($signInLogs.Count) total sign-in records from $pageCount pages" -Level "Info"
-        Update-GuiStatus "Retrieved $($signInLogs.Count) sign-in records. Processing geolocation..." ([System.Drawing.Color]::Orange)
+        #═══════════════════════════════════════════════════════════
+        # EXTRACT AND DEDUPLICATE IP ADDRESSES
+        #═══════════════════════════════════════════════════════════
         
-        #══════════════════════════════════════════════════════
-        # IP GEOLOCATION PROCESSING
-        #══════════════════════════════════════════════════════
+        Update-GuiStatus "Extracting unique IP addresses..." ([System.Drawing.Color]::Orange)
         
-        # Filter to valid sign-ins with public IP addresses
-        $validSignIns = $signInLogs | Where-Object { 
-            -not [string]::IsNullOrEmpty($_.ipAddress) -and 
-            $_.ipAddress -ne "127.0.0.1" -and 
-            $_.ipAddress -notmatch "^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\."
-        }
+        $uniqueIPs = $signInLogs | 
+            Where-Object { -not [string]::IsNullOrEmpty($_.ipAddress) } | 
+            Select-Object -ExpandProperty ipAddress -Unique
         
-        Write-Log "Filtered to $($validSignIns.Count) sign-ins with public IP addresses" -Level "Info"
+        Write-Log "Found $($uniqueIPs.Count) unique IP addresses (IPv4 and IPv6)" -Level "Info"
         
-        # Extract unique IPs for geolocation
-        $ipGroups = $validSignIns | Group-Object -Property ipAddress
-        $uniqueIPs = $ipGroups.Name | Where-Object { $_ -ne $null -and $_ -ne "" }
+        #═══════════════════════════════════════════════════════════
+        # PERFORM GEOLOCATION LOOKUPS WITH IPv6 SUPPORT
+        #═══════════════════════════════════════════════════════════
         
-        Write-Log "Identified $($uniqueIPs.Count) unique IP addresses for geolocation" -Level "Info"
-        Update-GuiStatus "Processing $($uniqueIPs.Count) unique IPs with geolocation..." ([System.Drawing.Color]::Orange)
-        
-        # Initialize IP cache
-        $ipCache = @{}
-        $geolocatedCount = 0
-        
-        # Geolocate each unique IP
         if ($uniqueIPs.Count -gt 0) {
-            Write-Log "Starting geolocation for $($uniqueIPs.Count) unique IPs" -Level "Info"
+            Update-GuiStatus "Starting geolocation lookups for $($uniqueIPs.Count) IPs (IPv4/IPv6)..." ([System.Drawing.Color]::Orange)
+            Write-Log "Beginning geolocation phase for IP addresses" -Level "Info"
+            
+            $geolocatedCount = 0
             
             foreach ($ip in $uniqueIPs) {
                 $geolocatedCount++
                 
-                # Progress update every 5 IPs
-                if ($geolocatedCount % 5 -eq 0 -or $geolocatedCount -eq $uniqueIPs.Count) {
-                    $percentage = [Math]::Round(($geolocatedCount / $uniqueIPs.Count) * 100, 1)
-                    Update-GuiStatus "Geolocating IPs: $geolocatedCount/$($uniqueIPs.Count) ($percentage%)" ([System.Drawing.Color]::Orange)
+                if ($geolocatedCount % 10 -eq 0) {
+                    $percentage = [math]::Round(($geolocatedCount / $uniqueIPs.Count) * 100, 1)
+                    Update-GuiStatus "Geolocating: $geolocatedCount/$($uniqueIPs.Count) ($percentage%)" ([System.Drawing.Color]::Orange)
                     [System.Windows.Forms.Application]::DoEvents()
                 }
                 
                 try {
                     $geoResult = Invoke-IPGeolocation -IPAddress $ip -Cache $ipCache
                     if ($geoResult) {
-                        Write-Log "Geolocated $ip : $($geoResult.city), $($geoResult.region_name), $($geoResult.country_name)" -Level "Info"
+                        $ipType = if ($geoResult.ip_version) { $geoResult.ip_version } else { "Unknown" }
+                        Write-Log "Geolocated $ip ($ipType): $($geoResult.city), $($geoResult.region_name), $($geoResult.country_name)" -Level "Info"
                     }
                 }
                 catch {
@@ -3038,12 +2916,12 @@ function Get-TenantSignInData {
                 }
             }
             
-            Write-Log "Geolocation completed for $($ipCache.Count) IPs" -Level "Info"
+            Write-Log "Geolocation completed for $($ipCache.Count) IP addresses" -Level "Info"
         }
         
-        #══════════════════════════════════════════════════════
+        #═══════════════════════════════════════════════════════════
         # PROCESS SIGN-IN RECORDS WITH GEOLOCATION
-        #══════════════════════════════════════════════════════
+        #═══════════════════════════════════════════════════════════
         
         Update-GuiStatus "Processing sign-in records with geolocation data..." ([System.Drawing.Color]::Orange)
         Write-Log "Processing all sign-in records with geolocation enrichment" -Level "Info"
@@ -3060,6 +2938,11 @@ function Get-TenantSignInData {
                 Update-GuiStatus "Processing sign-ins: $processedCount of $($signInLogs.Count) ($percentage%)" ([System.Drawing.Color]::Orange)
             }
             
+            # Extract basic sign-in info
+            $userId = $signIn.userPrincipalName
+            $userDisplayName = $signIn.userDisplayName
+            $creationTime = $signIn.createdDateTime
+            $userAgent = $signIn.userAgent
             $ip = $signIn.ipAddress
             
             # Initialize location defaults
@@ -3068,42 +2951,92 @@ function Get-TenantSignInData {
             $region = "Unknown"
             $country = "Unknown"
             $isp = "Unknown"
+            $ipVersion = "Unknown"
+            $isPrivateIP = $false
             
             # Apply geolocation data if available
-            if (-not [string]::IsNullOrEmpty($ip) -and $ip -ne "127.0.0.1") {
-                # Check if private IP
-                if ($ip -match "^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\.|^127\.") {
-                    $country = "Private/Local"
+            if (-not [string]::IsNullOrEmpty($ip)) {
+                # ═══════════════════════════════════════════════════════════
+                # VALIDATE IP ADDRESS (IPv4 or IPv6)
+                # ═══════════════════════════════════════════════════════════
+                
+                try {
+                    $ipObj = [System.Net.IPAddress]::Parse($ip)
+                    
+                    if ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                        # IPv4 Address
+                        $ipVersion = "IPv4"
+                        
+                        # Check IPv4 private ranges
+                        if ($ip -match "^10\." -or 
+                            $ip -match "^172\.(1[6-9]|2[0-9]|3[0-1])\." -or 
+                            $ip -match "^192\.168\." -or 
+                            $ip -match "^127\." -or 
+                            $ip -match "^169\.254\.") {
+                            $isPrivateIP = $true
+                        }
+                    }
+                    elseif ($ipObj.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+                        # IPv6 Address
+                        $ipVersion = "IPv6"
+                        $ipLower = $ip.ToLower()
+                        
+                        # Check IPv6 private/special ranges
+                        if ($ipLower -eq "::1" -or                           # Loopback
+                            $ipLower -match "^fe[89ab][0-9a-f]:" -or        # Link-local
+                            $ipLower -match "^f[cd][0-9a-f]{2}:" -or        # Unique local
+                            $ipLower -match "^fec[0-9a-f]:" -or             # Site-local (deprecated)
+                            $ipLower -match "^::ffff:" -or                   # IPv4-mapped
+                            $ipLower -match "^64:ff9b::") {                 # IPv4/IPv6 translation
+                            $isPrivateIP = $true
+                        }
+                    }
+                }
+                catch {
+                    # If we can't parse the IP, treat it as unknown
+                    Write-Log "Could not parse IP address: $ip" -Level "Warning"
+                    $ipVersion = "Invalid"
+                }
+                
+                # ═══════════════════════════════════════════════════════════
+                # APPLY GEOLOCATION DATA
+                # ═══════════════════════════════════════════════════════════
+                
+                if ($isPrivateIP) {
+                    # Private/Internal IP
                     $city = "Private Network"
-                    $region = "Private Network"
-                    $isp = "Private Network"
+                    $region = "Internal"
+                    $country = "Private Network"
+                    $isp = "Internal"
                 }
                 elseif ($ipCache.ContainsKey($ip)) {
-                    $cacheEntry = $ipCache[$ip]
-                    if ($cacheEntry -and $cacheEntry.Data) {
-                        $geoData = $cacheEntry.Data
-                        
-                        # Extract geolocation with null checking
-                        $city = if ($geoData.city -and $geoData.city -ne "null") { $geoData.city } else { "Unknown" }
-                        $region = if ($geoData.region_name -and $geoData.region_name -ne "null") { $geoData.region_name } else { "Unknown" }
-                        $country = if ($geoData.country_name -and $geoData.country_name -ne "null") { $geoData.country_name } else { "Unknown" }
-                        $isp = if ($geoData.connection -and $geoData.connection.isp) { $geoData.connection.isp } else { "Unknown" }
-                        
-                        # Determine if location is unusual
-                        if ($country -ne "Unknown") {
-                            $isUnusual = $ConfigData.ExpectedCountries -notcontains $country
-                        }
+                    # Use cached geolocation data
+                    $geoData = $ipCache[$ip].Data
+                    $city = $geoData.city
+                    $region = $geoData.region_name
+                    $country = $geoData.country_name
+                    $isp = $geoData.connection.isp
+                    
+                    # Override IP version from geo data if available
+                    if ($geoData.ip_version) {
+                        $ipVersion = $geoData.ip_version
+                    }
+                    
+                    # Check if unusual location (only for public IPs)
+                    if ($ConfigData.ExpectedCountries -notcontains $country) {
+                        $isUnusual = $true
                     }
                 }
             }
             
-            # Create enriched result object
+            # Create result object
             $resultObject = [PSCustomObject]@{
-                UserId = $signIn.userPrincipalName
-                UserDisplayName = $signIn.userDisplayName
-                CreationTime = [DateTime]::Parse($signIn.createdDateTime)
-                UserAgent = $signIn.userAgent
+                UserId = $userId
+                UserDisplayName = $userDisplayName
+                CreationTime = $creationTime
+                UserAgent = $userAgent
                 IP = $ip
+                IPVersion = $ipVersion
                 ISP = $isp
                 City = $city
                 RegionName = $region
@@ -3124,9 +3057,9 @@ function Get-TenantSignInData {
         
         Write-Log "Processed $($results.Count) sign-in records with geolocation" -Level "Info"
         
-        #══════════════════════════════════════════════════════
+        #═══════════════════════════════════════════════════════════
         # EXPORT RESULTS
-        #══════════════════════════════════════════════════════
+        #═══════════════════════════════════════════════════════════
         
         Update-GuiStatus "Exporting sign-in data..." ([System.Drawing.Color]::Orange)
         
@@ -3139,40 +3072,38 @@ function Get-TenantSignInData {
         if ($unusualSignIns.Count -gt 0) {
             $unusualOutputPath = $OutputPath -replace '.csv$', '_Unusual.csv'
             $unusualSignIns | Export-Csv -Path $unusualOutputPath -NoTypeInformation -Force
-            Write-Log "Found $($unusualSignIns.Count) sign-ins from unusual locations" -Level "Warning"
+            Write-Log "Exported $($unusualSignIns.Count) unusual location sign-ins to: $unusualOutputPath" -Level "Info"
         }
         
         # Export failed sign-ins
-        $failedSignIns = $results | Where-Object { $_.Status -ne "0" -and -not [string]::IsNullOrEmpty($_.Status) }
+        $failedSignIns = $results | Where-Object { $_.Status -ne "0" -and ![string]::IsNullOrEmpty($_.Status) }
         if ($failedSignIns.Count -gt 0) {
             $failedOutputPath = $OutputPath -replace '.csv$', '_Failed.csv'
             $failedSignIns | Export-Csv -Path $failedOutputPath -NoTypeInformation -Force
-            Write-Log "Found $($failedSignIns.Count) failed sign-in attempts" -Level "Warning"
+            Write-Log "Exported $($failedSignIns.Count) failed sign-ins to: $failedOutputPath" -Level "Info"
         }
         
         # Generate unique locations report
         Update-GuiStatus "Generating unique locations report..." ([System.Drawing.Color]::Orange)
+        
         $uniqueLogins = @()
         $userLocationGroups = $results | Group-Object -Property UserId
         
         foreach ($userGroup in $userLocationGroups) {
+            $userId = $userGroup.Name
             $userSignIns = $userGroup.Group
             
-            # Get unique combinations of location data per user
             $uniqueUserLocations = $userSignIns | 
-                Select-Object UserId, UserDisplayName, IP, City, RegionName, Country, ISP -Unique |
-                Where-Object { -not [string]::IsNullOrEmpty($_.IP) } |
-                Sort-Object Country, RegionName, City, IP
+                Select-Object UserId, UserDisplayName, IP, IPVersion, City, RegionName, Country, ISP -Unique |
+                Where-Object { -not [string]::IsNullOrEmpty($_.IP) }
             
             foreach ($location in $uniqueUserLocations) {
-                # Count sign-ins from this location
                 $signInCount = ($userSignIns | Where-Object { 
                     $_.IP -eq $location.IP -and 
                     $_.City -eq $location.City -and 
                     $_.Country -eq $location.Country 
                 }).Count
                 
-                # Get time range for this location
                 $locationSignIns = $userSignIns | Where-Object { 
                     $_.IP -eq $location.IP -and 
                     $_.City -eq $location.City -and 
@@ -3191,6 +3122,7 @@ function Get-TenantSignInData {
                     UserId = $location.UserId
                     UserDisplayName = $location.UserDisplayName
                     IP = $location.IP
+                    IPVersion = $location.IPVersion
                     City = $location.City
                     RegionName = $location.RegionName
                     Country = $location.Country
@@ -3199,81 +3131,63 @@ function Get-TenantSignInData {
                     SignInCount = $signInCount
                     FirstSeen = $firstSeen
                     LastSeen = $lastSeen
-                    DaysSinceFirst = if ($firstSeen) { 
-                        try { [math]::Round(((Get-Date) - [DateTime]::Parse($firstSeen)).TotalDays, 1) } catch { 0 }
-                    } else { 0 }
-                    DaysSinceLast = if ($lastSeen) { 
-                        try { [math]::Round(((Get-Date) - [DateTime]::Parse($lastSeen)).TotalDays, 1) } catch { 0 }
-                    } else { 0 }
                 }
                 
                 $uniqueLogins += $uniqueLogin
             }
         }
         
-        # Export unique locations
+        # Export unique logins
         if ($uniqueLogins.Count -gt 0) {
-            $uniqueLoginsPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UniqueSignInLocations.csv")
-            $uniqueLogins | Sort-Object UserId, Country, RegionName, City | 
-                Export-Csv -Path $uniqueLoginsPath -NoTypeInformation -Force
+            $uniqueLoginsPath = Join-Path -Path $ConfigData.WorkDir -ChildPath "UniqueSignInLocations.csv"
+            $uniqueLogins | Export-Csv -Path $uniqueLoginsPath -NoTypeInformation -Force
+            Write-Log "Exported $($uniqueLogins.Count) unique location records to: $uniqueLoginsPath" -Level "Info"
             
-            Write-Log "Created unique locations report with $($uniqueLogins.Count) unique locations" -Level "Info"
-            
-            # Export unusual unique locations
             $unusualUniqueLogins = $uniqueLogins | Where-Object { $_.IsUnusualLocation -eq $true }
             if ($unusualUniqueLogins.Count -gt 0) {
-                $unusualUniquePath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UniqueSignInLocations_Unusual.csv")
-                $unusualUniqueLogins | Sort-Object UserId, Country, RegionName, City |
-                    Export-Csv -Path $unusualUniquePath -NoTypeInformation -Force
-                Write-Log "Found $($unusualUniqueLogins.Count) unusual unique locations" -Level "Warning"
+                $unusualPath = Join-Path -Path $ConfigData.WorkDir -ChildPath "UniqueSignInLocations_Unusual.csv"
+                $unusualUniqueLogins | Export-Csv -Path $unusualPath -NoTypeInformation -Force
+                Write-Log "Exported $($unusualUniqueLogins.Count) unusual unique locations to: $unusualPath" -Level "Info"
             }
         }
         
-        #══════════════════════════════════════════════════════
-        # COMPLETION SUMMARY
-        #══════════════════════════════════════════════════════
+        #═══════════════════════════════════════════════════════════
+        # SUMMARY STATISTICS
+        #═══════════════════════════════════════════════════════════
         
-        $cacheStats = @{
-            TotalIPs = $ipCache.Count
-            SuccessfulGeo = ($ipCache.Values | Where-Object { $_ -ne $null }).Count
-        }
+        $ipv4Count = ($results | Where-Object { $_.IPVersion -eq "IPv4" }).Count
+        $ipv6Count = ($results | Where-Object { $_.IPVersion -eq "IPv6" }).Count
+        $privateIPCount = ($results | Where-Object { $_.Country -eq "Private Network" }).Count
         
-        Update-GuiStatus "Sign-in collection completed! Processed $($results.Count) records." ([System.Drawing.Color]::Green)
+        Update-GuiStatus "Sign-in collection complete: $($results.Count) records ($($unusualSignIns.Count) unusual, $($failedSignIns.Count) failed)" ([System.Drawing.Color]::Green)
         
-        Write-Log "═══════════════════════════════════════════════════" -Level "Info"
+        Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
         Write-Log "SIGN-IN DATA COLLECTION COMPLETED" -Level "Info"
-        Write-Log "Total records: $($results.Count)" -Level "Info"
-        Write-Log "Unusual locations: $($unusualSignIns.Count)" -Level "Info"
-        Write-Log "Failed sign-ins: $($failedSignIns.Count)" -Level "Info"
-        Write-Log "Unique IPs geolocated: $($cacheStats.TotalIPs)" -Level "Info"
-        Write-Log "Output file: $OutputPath" -Level "Info"
-        Write-Log "═══════════════════════════════════════════════════" -Level "Info"
+        Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
+        Write-Log "Total Sign-ins: $($results.Count)" -Level "Info"
+        Write-Log "  IPv4 Addresses: $ipv4Count" -Level "Info"
+        Write-Log "  IPv6 Addresses: $ipv6Count" -Level "Info"
+        Write-Log "  Private IPs: $privateIPCount" -Level "Info"
+        Write-Log "Unusual Locations: $($unusualSignIns.Count)" -Level "Info"
+        Write-Log "Failed Sign-ins: $($failedSignIns.Count)" -Level "Info"
+        Write-Log "Unique IP Locations: $($uniqueLogins.Count)" -Level "Info"
+        Write-Log "Geolocation Cache: $($ipCache.Count) IPs cached" -Level "Info"
+        Write-Log "Output Files:" -Level "Info"
+        Write-Log "  Main: $OutputPath" -Level "Info"
+        if ($unusualSignIns.Count -gt 0) {
+            Write-Log "  Unusual: $($OutputPath -replace '.csv$', '_Unusual.csv')" -Level "Info"
+        }
+        if ($failedSignIns.Count -gt 0) {
+            Write-Log "  Failed: $($OutputPath -replace '.csv$', '_Failed.csv')" -Level "Info"
+        }
+        Write-Log "═══════════════════════════════════════════════════════════" -Level "Info"
         
         return $results
     }
     catch {
-        $errorMsg = "Error collecting sign-in data: $($_.Exception.Message)"
-        Update-GuiStatus $errorMsg ([System.Drawing.Color]::Red)
-        Write-Log $errorMsg -Level "Error"
-        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "Error"
-        
-        # Offer Exchange Online fallback on error
-        if ($_.Exception.Message -like "*Forbidden*" -or $_.Exception.Message -like "*security defaults*") {
-            $fallbackChoice = [System.Windows.Forms.MessageBox]::Show(
-                "Graph API Access Denied`n`n" +
-                "Access to sign-in logs via Graph API was denied.`n" +
-                "This is common when Security Defaults are enabled.`n`n" +
-                "Try Exchange Online fallback method instead?",
-                "Access Denied - Use Fallback?",
-                "YesNo",
-                "Question"
-            )
-            
-            if ($fallbackChoice -eq "Yes") {
-                return Get-SignInDataFromExchangeOnline -DaysBack $DaysBack -OutputPath $OutputPath
-            }
-        }
-        
+        Update-GuiStatus "Error collecting sign-in data: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Error in sign-in data collection: $($_.Exception.Message)" -Level "Error"
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level "Error"
         return $null
     }
 }
@@ -3461,6 +3375,947 @@ function Get-SignInDataFromExchangeOnline {
     catch {
         Update-GuiStatus "Error collecting sign-in data via Exchange Online: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
         Write-Log "Error in Exchange Online sign-in data collection: $($_.Exception.Message)" -Level "Error"
+        return $null
+    }
+}
+
+function Get-MFAStatusAudit {
+    <#
+    .SYNOPSIS
+        Audits MFA enrollment and enforcement status for all users
+    
+    .DESCRIPTION
+        Checks ALL MFA enforcement mechanisms:
+        • Per-user MFA enforcement (Legacy - Enforced/Enabled/Disabled)
+        • Security Defaults (Modern - Enforces MFA for all users)
+        • Conditional Access policies (Modern - Policy-based MFA)
+        • Registered authentication methods
+        • MFA capability vs enforcement
+    #>
+    
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "MFAStatus.csv")
+    )
+    
+    Update-GuiStatus "Auditing comprehensive MFA status (legacy + modern enforcement)..." ([System.Drawing.Color]::Orange)
+    Write-Log "Starting comprehensive MFA audit including ALL enforcement methods" -Level "Info"
+    
+    try {
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # STEP 1: CHECK TENANT-WIDE MFA ENFORCEMENT MECHANISMS
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        # Check for Security Defaults (enforces MFA for all users automatically)
+        Write-Log "Checking Security Defaults status..." -Level "Info"
+        $securityDefaults = Test-SecurityDefaults
+        $securityDefaultsEnabled = $securityDefaults.IsEnabled -eq $true
+        
+        if ($securityDefaultsEnabled) {
+            Write-Log "Security Defaults are ENABLED - MFA is enforced for all users by default" -Level "Info"
+            Update-GuiStatus "Security Defaults detected: MFA enforced tenant-wide" ([System.Drawing.Color]::Green)
+        }
+        else {
+            Write-Log "Security Defaults are DISABLED - checking Conditional Access policies..." -Level "Info"
+        }
+        
+        # Check for Conditional Access policies that require MFA
+        Write-Log "Analyzing Conditional Access policies for MFA requirements..." -Level "Info"
+        $mfaCAPolicies = @()
+        $caAllUsersPolicy = $false
+        
+        try {
+            $caPolicies = Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop
+            
+            foreach ($policy in $caPolicies) {
+                # Only consider enabled policies
+                if ($policy.State -ne "enabled") { continue }
+                
+                # Check if policy grants control includes MFA
+                $requiresMFA = $false
+                if ($policy.GrantControls.BuiltInControls -contains "mfa") {
+                    $requiresMFA = $true
+                }
+                
+                if ($requiresMFA) {
+                    # Determine who the policy applies to
+                    $appliesToAllUsers = $false
+                    
+                    if ($policy.Conditions.Users.IncludeUsers -contains "All") {
+                        $appliesToAllUsers = $true
+                        $caAllUsersPolicy = $true
+                    }
+                    
+                    $mfaCAPolicies += [PSCustomObject]@{
+                        PolicyName = $policy.DisplayName
+                        PolicyId = $policy.Id
+                        AppliesToAllUsers = $appliesToAllUsers
+                        IncludeUsers = $policy.Conditions.Users.IncludeUsers
+                        IncludeGroups = $policy.Conditions.Users.IncludeGroups
+                        IncludeRoles = $policy.Conditions.Users.IncludeRoles
+                        ExcludeUsers = $policy.Conditions.Users.ExcludeUsers
+                        ExcludeGroups = $policy.Conditions.Users.ExcludeGroups
+                        ExcludeRoles = $policy.Conditions.Users.ExcludeRoles
+                    }
+                }
+            }
+            
+            Write-Log "Found $($mfaCAPolicies.Count) active Conditional Access policies requiring MFA" -Level "Info"
+            if ($caAllUsersPolicy) {
+                Write-Log "At least one CA policy applies MFA to ALL users" -Level "Info"
+                Update-GuiStatus "Conditional Access detected: MFA policy for all users" ([System.Drawing.Color]::Green)
+            }
+        }
+        catch {
+            Write-Log "Could not retrieve Conditional Access policies: $($_.Exception.Message)" -Level "Warning"
+            Update-GuiStatus "Warning: Could not check CA policies - results may be incomplete" ([System.Drawing.Color]::Orange)
+        }
+        
+        # Determine if MFA is enforced tenant-wide by any mechanism
+        $tenantWideMFAEnforced = $securityDefaultsEnabled -or $caAllUsersPolicy
+        
+        if ($tenantWideMFAEnforced) {
+            Write-Log "✅ Tenant-wide MFA enforcement detected" -Level "Info"
+        }
+        else {
+            Write-Log "⚠️ No tenant-wide MFA enforcement - relying on per-user or group-based policies" -Level "Warning"
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # STEP 2: LOAD USER DATA
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        Update-GuiStatus "Loading user data with MFA enforcement status..." ([System.Drawing.Color]::Orange)
+        
+        # Note: StrongAuthenticationRequirements property contains per-user MFA state
+        $users = Get-MgUser -All -Property Id, UserPrincipalName, DisplayName, AccountEnabled, StrongAuthenticationRequirements
+        
+        $mfaResults = @()
+        $processedCount = 0
+        
+        # Check if we have sign-in data for enhanced detection
+        $signInDataPath = Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData.csv"
+        $hasSignInData = Test-Path $signInDataPath
+        
+        $signInData = $null
+        if ($hasSignInData) {
+            try {
+                $signInData = Import-Csv -Path $signInDataPath
+                Write-Log "Loaded $($signInData.Count) sign-in records for MFA behavior analysis" -Level "Info"
+            } catch {
+                Write-Log "Could not load sign-in data: $($_.Exception.Message)" -Level "Warning"
+            }
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # STEP 3: ANALYZE EACH USER
+        # ═══════════════════════════════════════════════════════════════════════════════
+        
+        foreach ($user in $users) {
+            if (-not $user.AccountEnabled) { continue }
+            
+            $processedCount++
+            if ($processedCount % 50 -eq 0) {
+                $percentage = [math]::Round(($processedCount / $users.Count) * 100, 1)
+                Update-GuiStatus "Checking MFA status: $processedCount of $($users.Count) ($percentage%)" ([System.Drawing.Color]::Orange)
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CHECK 1: PER-USER MFA ENFORCEMENT (Legacy MFA)
+            # ───────────────────────────────────────────────────────────────────────────
+            $perUserMFAState = "Disabled"
+            $perUserMFAEnforced = $false
+            
+            try {
+                if ($user.StrongAuthenticationRequirements) {
+                    $mfaRequirements = $user.StrongAuthenticationRequirements
+                    
+                    if ($mfaRequirements.Count -gt 0) {
+                        # Per-user MFA has three states: Disabled, Enabled, Enforced
+                        $state = $mfaRequirements[0].State
+                        $perUserMFAState = $state
+                        
+                        if ($state -eq "Enforced" -or $state -eq "Enabled") {
+                            $perUserMFAEnforced = $true
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "Could not read per-user MFA state for $($user.UserPrincipalName): $($_.Exception.Message)" -Level "Warning"
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CHECK 2: CONDITIONAL ACCESS POLICY APPLICABILITY
+            # ───────────────────────────────────────────────────────────────────────────
+            $caPolicyEnforced = $false
+            $applicableCAPolicies = @()
+            
+            # If Security Defaults are enabled, all users have MFA enforced
+            if ($securityDefaultsEnabled) {
+                $caPolicyEnforced = $true
+                $applicableCAPolicies += "Security Defaults (tenant-wide)"
+            }
+            
+            # Check if user is covered by CA policies
+            # Note: This is a simplified check - full CA policy evaluation is complex
+            # and would require checking group memberships, roles, etc.
+            foreach ($policy in $mfaCAPolicies) {
+                if ($policy.AppliesToAllUsers) {
+                    $caPolicyEnforced = $true
+                    $applicableCAPolicies += $policy.PolicyName
+                }
+                # Additional logic could check group membership and roles here
+                # For now, we flag that CA policies exist but may need manual review
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CHECK 3: REGISTERED AUTHENTICATION METHODS
+            # ───────────────────────────────────────────────────────────────────────────
+            $hasMFAMethods = $false
+            $mfaMethods = @()
+            $methodCount = 0
+            
+            try {
+                $authMethods = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction Stop
+                
+                foreach ($method in $authMethods) {
+                    $methodType = $method.AdditionalProperties.'@odata.type'
+                    
+                    # Count only MFA-capable methods (exclude password)
+                    if ($methodType -match 'phone|fido2|softwareOath|microsoft|email|temporaryAccessPass') {
+                        $hasMFAMethods = $true
+                        $methodCount++
+                        
+                        # Parse method type for display
+                        $displayType = switch -Regex ($methodType) {
+                            'phoneAuthentication' { 'Phone' }
+                            'fido2Authentication' { 'FIDO2 Security Key' }
+                            'softwareOathAuthentication' { 'Authenticator App' }
+                            'microsoftAuthenticator' { 'Microsoft Authenticator' }
+                            'emailAuthentication' { 'Email' }
+                            'temporaryAccessPass' { 'Temporary Access Pass' }
+                            default { $methodType -replace '#microsoft\.graph\.', '' }
+                        }
+                        
+                        $mfaMethods += $displayType
+                    }
+                }
+            }
+            catch {
+                Write-Log "Could not retrieve auth methods for $($user.UserPrincipalName): $($_.Exception.Message)" -Level "Warning"
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CHECK 4: SIGN-IN BEHAVIOR (if available)
+            # ───────────────────────────────────────────────────────────────────────────
+            $lastSignInDate = ""
+            $totalSuccessfulSignIns = 0
+            $mfaUsedInSignIns = 0
+            
+            if ($signInData) {
+                $userSignIns = $signInData | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName }
+                
+                if ($userSignIns) {
+                    # Get most recent sign-in
+                    $mostRecent = $userSignIns | Sort-Object CreationTime -Descending | Select-Object -First 1
+                    $lastSignInDate = $mostRecent.CreationTime
+                    
+                    # Count successful sign-ins
+                    $successfulSignIns = $userSignIns | Where-Object { $_.Status -eq "0" }
+                    $totalSuccessfulSignIns = $successfulSignIns.Count
+                    
+                    # If Conditional Access is passing, MFA is likely being used
+                    $successfulWithCA = $successfulSignIns | Where-Object { 
+                        $_.ConditionalAccessStatus -eq "success" 
+                    }
+                    $mfaUsedInSignIns = $successfulWithCA.Count
+                }
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CHECK 5: ADMIN ROLE STATUS
+            # ───────────────────────────────────────────────────────────────────────────
+            $isAdmin = $false
+            $adminRoles = @()
+            
+            try {
+                $memberOf = Get-MgUserMemberOf -UserId $user.Id -All
+                $roles = $memberOf | Where-Object { 
+                    $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.directoryRole'
+                }
+                
+                foreach ($role in $roles) {
+                    $roleName = $role.AdditionalProperties.displayName
+                    if ($roleName -like '*Admin*') {
+                        $isAdmin = $true
+                        $adminRoles += $roleName
+                    }
+                }
+            } catch { }
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # DETERMINE OVERALL MFA STATUS (UPDATED LOGIC)
+            # ═══════════════════════════════════════════════════════════════════════════
+            
+            # Determine if MFA is actually ENFORCED for this user
+            # MFA is enforced if ANY of these are true:
+            # 1. Per-user MFA is enforced (legacy)
+            # 2. Security Defaults are enabled (modern tenant-wide)
+            # 3. CA policy requires MFA for this user (modern policy-based)
+            $mfaEnforced = $perUserMFAEnforced -or $caPolicyEnforced
+            
+            # Determine if user has MFA capability (methods registered)
+            $mfaCapable = $hasMFAMethods
+            
+            # Overall MFA status
+            $overallMFAStatus = "No"
+            $mfaStatusDetail = "No MFA"
+            $enforcementMethod = @()
+            
+            # Build list of enforcement methods
+            if ($perUserMFAEnforced) {
+                $enforcementMethod += "Per-User MFA ($perUserMFAState)"
+            }
+            if ($securityDefaultsEnabled) {
+                $enforcementMethod += "Security Defaults"
+            }
+            if ($applicableCAPolicies.Count -gt 0 -and -not $securityDefaultsEnabled) {
+                $enforcementMethod += "Conditional Access"
+            }
+            
+            # Determine overall status
+            if ($mfaEnforced -and $mfaCapable) {
+                $overallMFAStatus = "Yes"
+                $enforcementList = $enforcementMethod -join " + "
+                $mfaStatusDetail = "✅ Enforced via $enforcementList with $methodCount method(s) registered"
+            }
+            elseif ($mfaEnforced -and -not $mfaCapable) {
+                $overallMFAStatus = "Partial"
+                $enforcementList = $enforcementMethod -join " + "
+                $mfaStatusDetail = "⚠️ Enforced via $enforcementList but NO methods registered (broken state)"
+            }
+            elseif (-not $mfaEnforced -and $mfaCapable) {
+                $overallMFAStatus = "Capable"
+                $mfaStatusDetail = "⚠️ Methods registered ($methodCount) but NOT enforced"
+            }
+            elseif ($mfaUsedInSignIns -gt 0 -and $totalSuccessfulSignIns -gt 0) {
+                # If we see MFA being used in sign-ins but can't confirm enforcement
+                $mfaPercent = [math]::Round(($mfaUsedInSignIns / $totalSuccessfulSignIns) * 100, 0)
+                if ($mfaPercent -gt 80) {
+                    $overallMFAStatus = "Likely"
+                    $mfaStatusDetail = "Inferred from sign-in behavior ($mfaPercent% MFA usage)"
+                }
+                else {
+                    $overallMFAStatus = "Inconsistent"
+                    $mfaStatusDetail = "Inconsistent MFA usage ($mfaPercent%)"
+                }
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CALCULATE RISK LEVEL
+            # ───────────────────────────────────────────────────────────────────────────
+            $riskLevel = "Unknown"
+            $recommendation = ""
+            
+            if ($overallMFAStatus -eq "Yes") {
+                $riskLevel = "Low"
+                $recommendation = "✅ MFA properly configured and enforced"
+            }
+            elseif ($overallMFAStatus -eq "No") {
+                if ($isAdmin) {
+                    $riskLevel = "Critical"
+                    $recommendation = "🚨 CRITICAL: Admin account with NO MFA - Enable immediately!"
+                }
+                else {
+                    $riskLevel = "High"
+                    $recommendation = "⚠️ HIGH: No MFA protection - Enable per-user MFA or Conditional Access policy"
+                }
+            }
+            elseif ($overallMFAStatus -eq "Partial") {
+                if ($isAdmin) {
+                    $riskLevel = "Critical"
+                    $recommendation = "🚨 CRITICAL: MFA enforced but no methods registered - User cannot sign in!"
+                }
+                else {
+                    $riskLevel = "High"
+                    $recommendation = "⚠️ HIGH: MFA enforced but no methods - User needs to register auth methods"
+                }
+            }
+            elseif ($overallMFAStatus -eq "Capable") {
+                if ($isAdmin) {
+                    $riskLevel = "High"
+                    $recommendation = "⚠️ HIGH: Admin has MFA methods but not enforced - Enable enforcement"
+                }
+                else {
+                    $riskLevel = "Medium"
+                    $recommendation = "⚡ MEDIUM: MFA methods registered but not enforced - Enable per-user MFA or CA policy"
+                }
+            }
+            elseif ($overallMFAStatus -eq "Likely" -or $overallMFAStatus -eq "Inconsistent") {
+                $riskLevel = "Medium"
+                $recommendation = "⚡ MEDIUM: Cannot fully verify MFA status - Manual review recommended"
+            }
+            
+            # ───────────────────────────────────────────────────────────────────────────
+            # CREATE RESULT OBJECT
+            # ───────────────────────────────────────────────────────────────────────────
+            $mfaResults += [PSCustomObject]@{
+                UserPrincipalName = $user.UserPrincipalName
+                DisplayName = $user.DisplayName
+                
+                # Overall Status
+                HasMFA = $overallMFAStatus
+                MFAStatusDetail = $mfaStatusDetail
+                
+                # Enforcement Methods (NEW)
+                EnforcementMethod = if ($enforcementMethod.Count -gt 0) { $enforcementMethod -join "; " } else { "None" }
+                SecurityDefaults = if ($securityDefaultsEnabled) { "Enabled (Tenant-wide)" } else { "Disabled" }
+                ConditionalAccessPolicies = if ($applicableCAPolicies.Count -gt 0) { $applicableCAPolicies -join "; " } else { "None" }
+                
+                # Per-User MFA (Legacy)
+                PerUserMFAState = $perUserMFAState
+                PerUserMFAEnforced = $perUserMFAEnforced
+                
+                # Authentication Methods
+                HasMFAMethods = $hasMFAMethods
+                MethodCount = $methodCount
+                MFAMethods = if ($mfaMethods.Count -gt 0) { $mfaMethods -join ", " } else { "None" }
+                
+                # Sign-in Behavior
+                LastSignIn = $lastSignInDate
+                TotalSuccessfulSignIns = $totalSuccessfulSignIns
+                MFAUsedCount = $mfaUsedInSignIns
+                MFAUsagePercent = if ($totalSuccessfulSignIns -gt 0) { 
+                    [math]::Round(($mfaUsedInSignIns / $totalSuccessfulSignIns) * 100, 0) 
+                } else { 0 }
+                
+                # Admin Status
+                IsAdmin = $isAdmin
+                AdminRoles = if ($adminRoles.Count -gt 0) { $adminRoles -join ", " } else { "" }
+                
+                # Risk Assessment
+                RiskLevel = $riskLevel
+                Recommendation = $recommendation
+            }
+        }
+        
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # EXPORT RESULTS
+        # ═══════════════════════════════════════════════════════════════════════════════
+        if ($mfaResults.Count -gt 0) {
+            $mfaResults | Export-Csv -Path $OutputPath -NoTypeInformation -Force
+            
+            # Create summary report
+            $totalUsers = $mfaResults.Count
+            $mfaEnabled = ($mfaResults | Where-Object { $_.HasMFA -eq "Yes" }).Count
+            $mfaCapable = ($mfaResults | Where-Object { $_.HasMFA -eq "Capable" }).Count
+            $noMFA = ($mfaResults | Where-Object { $_.HasMFA -eq "No" }).Count
+            $criticalRisk = ($mfaResults | Where-Object { $_.RiskLevel -eq "Critical" }).Count
+            
+            $summaryPath = $OutputPath -replace '.csv$', '_Summary.txt'
+            $summary = @"
+═══════════════════════════════════════════════════════════════════════════════
+MFA STATUS AUDIT SUMMARY
+Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+═══════════════════════════════════════════════════════════════════════════════
+
+TENANT-WIDE ENFORCEMENT:
+  Security Defaults: $(if ($securityDefaultsEnabled) { "✅ ENABLED (MFA enforced for all users)" } else { "❌ DISABLED" })
+  CA Policies Found: $($mfaCAPolicies.Count) active policies requiring MFA
+  All-Users CA Policy: $(if ($caAllUsersPolicy) { "✅ YES" } else { "❌ NO" })
+
+USER STATISTICS:
+  Total Active Users: $totalUsers
+  MFA Enabled: $mfaEnabled ($([math]::Round(($mfaEnabled/$totalUsers)*100, 1))%)
+  MFA Capable (not enforced): $mfaCapable ($([math]::Round(($mfaCapable/$totalUsers)*100, 1))%)
+  No MFA: $noMFA ($([math]::Round(($noMFA/$totalUsers)*100, 1))%)
+  Critical Risk Users: $criticalRisk
+
+DETAILED RESULTS: $OutputPath
+═══════════════════════════════════════════════════════════════════════════════
+"@
+            
+            $summary | Out-File -FilePath $summaryPath -Force
+            
+            Write-Log "MFA audit complete!" -Level "Info"
+            Write-Log "  Total users analyzed: $totalUsers" -Level "Info"
+            Write-Log "  MFA Enabled: $mfaEnabled" -Level "Info"
+            Write-Log "  MFA Capable: $mfaCapable" -Level "Info"
+            Write-Log "  No MFA: $noMFA" -Level "Info"
+            Write-Log "  Critical Risk: $criticalRisk" -Level "Info"
+            Write-Log "  Results exported to: $OutputPath" -Level "Info"
+            Write-Log "  Summary exported to: $summaryPath" -Level "Info"
+            
+            Update-GuiStatus "MFA audit complete! Found $mfaEnabled/$totalUsers users with MFA enabled." ([System.Drawing.Color]::Green)
+            
+            return $mfaResults
+        }
+        else {
+            Write-Log "No enabled users found" -Level "Warning"
+            Update-GuiStatus "No enabled users found to audit" ([System.Drawing.Color]::Orange)
+            return $null
+        }
+    }
+    catch {
+        Update-GuiStatus "Error in MFA audit: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Error in MFA status audit: $($_.Exception.Message)" -Level "Error"
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level "Error"
+        return $null
+    }
+}
+
+function Get-FailedLoginPatterns {
+    <#
+    .SYNOPSIS
+        Analyzes failed login patterns to detect attacks and breaches
+    
+    .DESCRIPTION
+        Reviews sign-in data to identify:
+        • Password spray attacks (same IP, many users)
+        • Brute force attacks (same user, many attempts)
+        • Confirmed breaches (5+ failures then success from SAME IP)
+    #>
+    
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [string]$SignInDataPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "UserLocationData.csv"),
+        
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "FailedLoginAnalysis.csv")
+    )
+    
+    Update-GuiStatus "Analyzing failed login patterns..." ([System.Drawing.Color]::Orange)
+    Write-Log "Starting failed login pattern analysis" -Level "Info"
+    
+    try {
+        if (-not (Test-Path $SignInDataPath)) {
+            Update-GuiStatus "Sign-in data not found! Run Get-TenantSignInData first." ([System.Drawing.Color]::Red)
+            Write-Log "Sign-in data file not found: $SignInDataPath" -Level "Error"
+            return $null
+        }
+        
+        $signInData = Import-Csv -Path $SignInDataPath
+        $failedLogins = $signInData | Where-Object { $_.Status -ne "0" -and ![string]::IsNullOrEmpty($_.Status) }
+        $successfulLogins = $signInData | Where-Object { $_.Status -eq "0" -or [string]::IsNullOrEmpty($_.Status) }
+        
+        Write-Log "Found $($failedLogins.Count) failed logins and $($successfulLogins.Count) successful logins" -Level "Info"
+        
+        $patterns = @()
+        
+        #═══════════════════════════════════════════════════════════
+        # PATTERN 1: PASSWORD SPRAY DETECTION
+        # Same IP attacking multiple users
+        #═══════════════════════════════════════════════════════════
+        Update-GuiStatus "Detecting password spray attacks..." ([System.Drawing.Color]::Orange)
+        
+        $ipGroups = $failedLogins | Group-Object -Property IP
+        foreach ($ipGroup in $ipGroups) {
+            $uniqueUsers = ($ipGroup.Group | Select-Object -Unique UserId).Count
+            $totalAttempts = $ipGroup.Count
+            
+            if ($totalAttempts -ge 10 -and $uniqueUsers -ge 5) {
+                $timespan = 0
+                if ($ipGroup.Group.Count -gt 1) {
+                    $firstAttempt = [DateTime]($ipGroup.Group | Sort-Object CreationTime | Select-Object -First 1).CreationTime
+                    $lastAttempt = [DateTime]($ipGroup.Group | Sort-Object CreationTime | Select-Object -Last 1).CreationTime
+                    $timespan = [math]::Round(($lastAttempt - $firstAttempt).TotalHours, 1)
+                }
+                
+                $patterns += [PSCustomObject]@{
+                    PatternType = "Password Spray"
+                    SourceIP = $ipGroup.Name
+                    Location = ($ipGroup.Group | Select-Object -First 1).City + ", " + ($ipGroup.Group | Select-Object -First 1).Country
+                    ISP = ($ipGroup.Group | Select-Object -First 1).ISP
+                    TargetedUsers = $uniqueUsers
+                    FailedAttempts = $totalAttempts
+                    TimeSpan = $timespan
+                    FirstSeen = ($ipGroup.Group | Sort-Object CreationTime | Select-Object -First 1).CreationTime
+                    LastSeen = ($ipGroup.Group | Sort-Object CreationTime | Select-Object -Last 1).CreationTime
+                    RiskLevel = if ($uniqueUsers -ge 20 -or $totalAttempts -ge 50) { "Critical" } 
+                               elseif ($uniqueUsers -ge 10 -or $totalAttempts -ge 25) { "High" }
+                               else { "Medium" }
+                    SuccessfulBreach = $false
+                    Details = "Password Spray: IP $($ipGroup.Name) attempted $totalAttempts failed logins against $uniqueUsers different users"
+                }
+            }
+        }
+        
+        #═══════════════════════════════════════════════════════════
+        # PATTERN 2: BRUTE FORCE DETECTION
+        # Same user, multiple failed attempts
+        #═══════════════════════════════════════════════════════════
+        Update-GuiStatus "Detecting brute force attacks..." ([System.Drawing.Color]::Orange)
+        
+        $userGroups = $failedLogins | Group-Object -Property UserId
+        foreach ($userGroup in $userGroups) {
+            $totalAttempts = $userGroup.Count
+            $uniqueIPs = ($userGroup.Group | Select-Object -Unique IP).Count
+            
+            if ($totalAttempts -ge 10) {
+                $timespan = 0
+                if ($userGroup.Group.Count -gt 1) {
+                    $firstAttempt = [DateTime]($userGroup.Group | Sort-Object CreationTime | Select-Object -First 1).CreationTime
+                    $lastAttempt = [DateTime]($userGroup.Group | Sort-Object CreationTime | Select-Object -Last 1).CreationTime
+                    $timespan = [math]::Round(($lastAttempt - $firstAttempt).TotalHours, 1)
+                }
+                
+                $patterns += [PSCustomObject]@{
+                    PatternType = "Brute Force"
+                    SourceIP = if ($uniqueIPs -eq 1) { ($userGroup.Group | Select-Object -First 1).IP } else { "Multiple IPs ($uniqueIPs)" }
+                    Location = if ($uniqueIPs -eq 1) { 
+                        ($userGroup.Group | Select-Object -First 1).City + ", " + ($userGroup.Group | Select-Object -First 1).Country 
+                    } else { "Multiple Locations" }
+                    ISP = if ($uniqueIPs -eq 1) { ($userGroup.Group | Select-Object -First 1).ISP } else { "Various" }
+                    TargetedUsers = 1
+                    FailedAttempts = $totalAttempts
+                    TimeSpan = $timespan
+                    FirstSeen = ($userGroup.Group | Sort-Object CreationTime | Select-Object -First 1).CreationTime
+                    LastSeen = ($userGroup.Group | Sort-Object CreationTime | Select-Object -Last 1).CreationTime
+                    RiskLevel = if ($totalAttempts -ge 50) { "Critical" } 
+                               elseif ($totalAttempts -ge 25) { "High" }
+                               else { "Medium" }
+                    SuccessfulBreach = $false
+                    Details = "Brute Force: User $($userGroup.Name) had $totalAttempts failed login attempts from $uniqueIPs different IP(s)"
+                }
+            }
+        }
+        
+        #═══════════════════════════════════════════════════════════
+        # PATTERN 3: SUCCESSFUL BREACH AFTER FAILURES
+        # Require 5+ failed attempts AND successful login from SAME IP
+        #═══════════════════════════════════════════════════════════
+        Update-GuiStatus "Detecting successful breaches (5+ failures, same IP required)..." ([System.Drawing.Color]::Orange)
+        
+        # Group failed logins by user and IP combination
+        $failedByUserIP = $failedLogins | Group-Object -Property { "$($_.UserId)|$($_.IP)" }
+        
+        $breachCount = 0
+        foreach ($group in $failedByUserIP) {
+            # Require at least 5 failed attempts
+            if ($group.Count -lt 5) { continue }
+            
+            # Parse the grouped key
+            $parts = $group.Name -split '\|'
+            if ($parts.Count -ne 2) { continue }
+            
+            $userId = $parts[0]
+            $ip = $parts[1]
+            
+            # Skip if missing critical info
+            if ([string]::IsNullOrWhiteSpace($userId) -or [string]::IsNullOrWhiteSpace($ip)) { continue }
+            
+            # Get the failed attempts sorted by time
+            $attempts = $group.Group | Sort-Object CreationTime
+            $firstFailedTime = [DateTime]($attempts[0].CreationTime)
+            $lastFailedTime = [DateTime]($attempts[-1].CreationTime)
+            
+            # CRITICAL: Look for successful login from THE EXACT SAME IP
+            # This ensures legitimate logins from office/home don't get flagged
+            $breach = $successfulLogins | Where-Object {
+                $_.IP -eq $ip -and                                          # MUST be same IP
+                $_.UserId -eq $userId -and                                   # Same user
+                [DateTime]$_.CreationTime -gt $lastFailedTime -and          # After last failure
+                ([DateTime]$_.CreationTime - $firstFailedTime).TotalHours -le 2  # Within 2 hours
+            } | Select-Object -First 1
+            
+            if ($breach) {
+                # Double-check the IP match (redundant but safe)
+                if ($breach.IP -ne $ip) {
+                    Write-Log "Skipping false positive: Success from $($breach.IP), failures from $ip for $userId" -Level "Info"
+                    continue
+                }
+                
+                # Check if already logged
+                $existing = $patterns | Where-Object {
+                    $_.PatternType -eq "Successful Breach" -and
+                    $_.SourceIP -eq $ip -and
+                    $_.Details -like "*$userId*"
+                }
+                
+                if (-not $existing) {
+                    $breachCount++
+                    $breachTime = [DateTime]$breach.CreationTime
+                    $totalFailedAttempts = $group.Count
+                    $timeToBreach = [math]::Round(($breachTime - $lastFailedTime).TotalMinutes, 1)
+                    
+                    $patterns += [PSCustomObject]@{
+                        PatternType = "Successful Breach"
+                        SourceIP = $ip
+                        Location = $attempts[0].City + ", " + $attempts[0].Country
+                        ISP = $attempts[0].ISP
+                        TargetedUsers = 1
+                        FailedAttempts = $totalFailedAttempts
+                        TimeSpan = [math]::Round(($breachTime - $firstFailedTime).TotalHours, 2)
+                        FirstSeen = $attempts[0].CreationTime
+                        LastSeen = $breach.CreationTime
+                        RiskLevel = if ($totalFailedAttempts -ge 20) { "Critical" } 
+                                   elseif ($totalFailedAttempts -ge 10) { "High" } 
+                                   else { "Medium" }
+                        SuccessfulBreach = $true
+                        Details = "CONFIRMED BREACH: User $userId - $totalFailedAttempts failed attempts from $ip ($($attempts[0].City), $($attempts[0].Country)), then successful login from SAME IP after $timeToBreach min"
+                    }
+                    
+                    Write-Log "BREACH DETECTED: $userId - $totalFailedAttempts failures from $ip, success from same IP after $timeToBreach min" -Level "Warning"
+                }
+            }
+        }
+        
+        Write-Log "Breach detection complete: $breachCount confirmed breaches (same IP requirement)" -Level "Info"
+        
+        # Export results
+        if ($patterns.Count -gt 0) {
+            $patterns | Sort-Object RiskLevel, FailedAttempts -Descending | 
+                Export-Csv -Path $OutputPath -NoTypeInformation -Force
+            
+            $criticalPatterns = $patterns | Where-Object { $_.RiskLevel -eq "Critical" }
+            if ($criticalPatterns.Count -gt 0) {
+                $criticalPath = $OutputPath -replace '.csv$', '_Critical.csv'
+                $criticalPatterns | Export-Csv -Path $criticalPath -NoTypeInformation -Force
+            }
+            
+            $breaches = $patterns | Where-Object { $_.SuccessfulBreach -eq $true }
+            if ($breaches.Count -gt 0) {
+                $breachPath = $OutputPath -replace '.csv$', '_Breaches.csv'
+                $breaches | Export-Csv -Path $breachPath -NoTypeInformation -Force
+            }
+            
+            $stats = @{
+                TotalPatterns = $patterns.Count
+                PasswordSpray = ($patterns | Where-Object { $_.PatternType -eq "Password Spray" }).Count
+                BruteForce = ($patterns | Where-Object { $_.PatternType -eq "Brute Force" }).Count
+                Breaches = $breaches.Count
+                Critical = $criticalPatterns.Count
+            }
+            
+            Update-GuiStatus "Attack analysis complete: $($stats.TotalPatterns) patterns detected ($($stats.Breaches) confirmed breaches)" ([System.Drawing.Color]::Green)
+            Write-Log "Attack Pattern Summary:" -Level "Info"
+            Write-Log "  Total Patterns: $($stats.TotalPatterns)" -Level "Info"
+            Write-Log "  Password Spray: $($stats.PasswordSpray)" -Level "Info"
+            Write-Log "  Brute Force: $($stats.BruteForce)" -Level "Info"
+            Write-Log "  Confirmed Breaches: $($stats.Breaches) (5+ failures + same IP success)" -Level "Info"
+            Write-Log "  Critical Risk: $($stats.Critical)" -Level "Info"
+        }
+        else {
+            Update-GuiStatus "No suspicious failed login patterns detected" ([System.Drawing.Color]::Green)
+            Write-Log "No attack patterns detected" -Level "Info"
+        }
+        
+        return $patterns
+    }
+    catch {
+        Update-GuiStatus "Error analyzing failed logins: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Failed login analysis error: $($_.Exception.Message)" -Level "Error"
+        return $null
+    }
+}
+
+function Get-RecentPasswordChanges {
+    <#
+    .SYNOPSIS
+        Identifies suspicious password reset patterns
+    
+    .DESCRIPTION
+        Analyzes admin audit logs for password change patterns
+    #>
+    
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [string]$AdminAuditPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "AdminAuditLogs_HighRisk.csv"),
+        
+        [Parameter(Mandatory = $false)]
+        [string]$OutputPath = (Join-Path -Path $ConfigData.WorkDir -ChildPath "PasswordChangeAnalysis.csv")
+    )
+    
+    Update-GuiStatus "Analyzing password change patterns..." ([System.Drawing.Color]::Orange)
+    Write-Log "Starting password change analysis" -Level "Info"
+    
+    try {
+        # Check if admin audit data exists
+        if (-not (Test-Path $AdminAuditPath)) {
+            Update-GuiStatus "Admin audit data not found! Run Get-AdminAuditData first." ([System.Drawing.Color]::Red)
+            Write-Log "Admin audit file not found: $AdminAuditPath" -Level "Error"
+            return $null
+        }
+        
+        # Import admin audit data
+        Update-GuiStatus "Loading admin audit data..." ([System.Drawing.Color]::Orange)
+        $auditData = Import-Csv -Path $AdminAuditPath
+        Write-Log "Loaded $($auditData.Count) audit records" -Level "Info"
+        
+        # Filter password change events with valid dates
+        $passwordEvents = $auditData | Where-Object {
+            ($_.Activity -like "*password*" -or
+             $_.Activity -like "*Reset user password*" -or
+             $_.Activity -like "*Change user password*") -and
+            (-not [string]::IsNullOrWhiteSpace($_.ActivityDate))
+        }
+        
+        Write-Log "Found $($passwordEvents.Count) password-related events with valid dates" -Level "Info"
+        
+        if ($passwordEvents.Count -eq 0) {
+            Update-GuiStatus "No password change events found" ([System.Drawing.Color]::Green)
+            Write-Log "No password changes detected in audit logs" -Level "Info"
+            return @()
+        }
+        
+        $suspiciousPatterns = @()
+        
+        # Group by target user
+        $userGroups = $passwordEvents | Group-Object -Property TargetUser | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) }
+        
+        foreach ($userGroup in $userGroups) {
+            try {
+                # Sort events and convert dates
+                $events = $userGroup.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ActivityDate) } | Sort-Object ActivityDate
+                $changeCount = $events.Count
+                
+                # Skip users with only 1 password change
+                if ($changeCount -eq 1) { continue }
+                
+                # Safe date conversion with error handling
+                $firstChange = $null
+                $lastChange = $null
+                
+                try {
+                    $firstChange = [DateTime]::Parse($events[0].ActivityDate)
+                    $lastChange = [DateTime]::Parse($events[-1].ActivityDate)
+                } catch {
+                    Write-Log "Date parsing error for user $($userGroup.Name): $($_.Exception.Message)" -Level "Warning"
+                    continue
+                }
+                
+                $timespan = ($lastChange - $firstChange).TotalHours
+                
+                # Calculate who initiated changes
+                $initiators = ($events | Where-Object { -not [string]::IsNullOrWhiteSpace($_.InitiatedBy) } | Select-Object -Unique InitiatedBy).Count
+                $selfReset = ($events | Where-Object { $_.InitiatedBy -eq $_.TargetUser }).Count
+                $adminReset = ($events | Where-Object { $_.InitiatedBy -ne $_.TargetUser }).Count
+                
+                # Check for off-hours activity (before 6 AM or after 10 PM)
+                $offHoursChanges = 0
+                foreach ($event in $events) {
+                    try {
+                        $eventDate = [DateTime]::Parse($event.ActivityDate)
+                        $hour = $eventDate.Hour
+                        if ($hour -lt 6 -or $hour -gt 22) {
+                            $offHoursChanges++
+                        }
+                    } catch {
+                        # Skip events with unparseable dates
+                        continue
+                    }
+                }
+                
+                # SUSPICIOUS PATTERN DETECTION
+                $isSuspicious = $false
+                $reasons = @()
+                $riskScore = 0
+                
+                # Multiple changes in 24 hours
+                if ($timespan -lt 24 -and $changeCount -ge 3) {
+                    $isSuspicious = $true
+                    $reasons += "Multiple password changes ($changeCount) within 24 hours"
+                    $riskScore += 25
+                }
+                
+                # Very rapid changes (less than 6 hours)
+                if ($timespan -lt 6 -and $changeCount -ge 2) {
+                    $isSuspicious = $true
+                    $reasons += "Rapid password changes in less than 6 hours"
+                    $riskScore += 35
+                }
+                
+                # Multiple initiators (different people resetting password)
+                if ($initiators -gt 2) {
+                    $isSuspicious = $true
+                    $reasons += "Password reset by $initiators different people"
+                    $riskScore += 20
+                }
+                
+                # Off-hours activity
+                if ($offHoursChanges -ge 2) {
+                    $isSuspicious = $true
+                    $reasons += "$offHoursChanges password changes during off-hours"
+                    $riskScore += 15
+                }
+                
+                # Many changes over longer period
+                if ($changeCount -ge 5) {
+                    $isSuspicious = $true
+                    $reasons += "Excessive password changes ($changeCount total)"
+                    $riskScore += 20
+                }
+                
+                if ($isSuspicious) {
+                    $riskLevel = if ($riskScore -ge 50) { "Critical" }
+                                elseif ($riskScore -ge 30) { "High" }
+                                elseif ($riskScore -ge 15) { "Medium" }
+                                else { "Low" }
+                    
+                    $suspiciousPatterns += [PSCustomObject]@{
+                        User = $userGroup.Name
+                        ChangeCount = $changeCount
+                        TimeSpanHours = [math]::Round($timespan, 1)
+                        FirstChange = $firstChange.ToString("yyyy-MM-dd HH:mm")
+                        LastChange = $lastChange.ToString("yyyy-MM-dd HH:mm")
+                        UniqueInitiators = $initiators
+                        SelfResets = $selfReset
+                        AdminResets = $adminReset
+                        OffHoursChanges = $offHoursChanges
+                        RiskScore = $riskScore
+                        RiskLevel = $riskLevel
+                        SuspiciousReasons = ($reasons -join "; ")
+                        Recommendation = if ($riskScore -ge 50) {
+                            "URGENT: Investigate immediately - possible active compromise"
+                        } elseif ($riskScore -ge 30) {
+                            "HIGH PRIORITY: Review account activity"
+                        } else {
+                            "Review account for suspicious activity"
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Log "Error processing password changes for $($userGroup.Name): $($_.Exception.Message)" -Level "Warning"
+                continue
+            }
+        }
+        
+        # Export results
+        if ($suspiciousPatterns.Count -gt 0) {
+            $suspiciousPatterns | Sort-Object RiskScore -Descending | 
+                Export-Csv -Path $OutputPath -NoTypeInformation -Force
+            
+            # Create critical file
+            $critical = $suspiciousPatterns | Where-Object { $_.RiskLevel -eq "Critical" }
+            if ($critical.Count -gt 0) {
+                $criticalPath = $OutputPath -replace '.csv$', '_Critical.csv'
+                $critical | Export-Csv -Path $criticalPath -NoTypeInformation -Force
+            }
+            
+            $stats = @{
+                Total = $suspiciousPatterns.Count
+                Critical = ($suspiciousPatterns | Where-Object { $_.RiskLevel -eq "Critical" }).Count
+                High = ($suspiciousPatterns | Where-Object { $_.RiskLevel -eq "High" }).Count
+            }
+            
+            Update-GuiStatus "Password change analysis complete: $($stats.Total) suspicious patterns ($($stats.Critical) critical)" ([System.Drawing.Color]::Green)
+            Write-Log "Password Change Analysis: Total=$($stats.Total), Critical=$($stats.Critical), High=$($stats.High)" -Level "Info"
+        }
+        else {
+            Update-GuiStatus "No suspicious password change patterns detected" ([System.Drawing.Color]::Green)
+            Write-Log "No suspicious password patterns found" -Level "Info"
+        }
+        
+        return $suspiciousPatterns
+    }
+    catch {
+        Update-GuiStatus "Error analyzing password changes: $($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        Write-Log "Password change analysis error: $($_.Exception.Message)" -Level "Error"
         return $null
     }
 }
@@ -5044,6 +5899,21 @@ function Invoke-CompromiseDetection {
             Data = $null
             Available = $false
         }
+		MFAStatusData = @{
+			Path = Join-Path -Path $ConfigData.WorkDir -ChildPath "MFAStatus.csv"
+			Data = $null
+			Available = $false
+		}
+		FailedLoginPatterns = @{
+			Path = Join-Path -Path $ConfigData.WorkDir -ChildPath "FailedLoginAnalysis.csv"
+			Data = $null
+			Available = $false
+		}
+		PasswordChangeData = @{
+			Path = Join-Path -Path $ConfigData.WorkDir -ChildPath "PasswordChangeAnalysis.csv"
+			Data = $null
+			Available = $false
+		}
     }
     
     Update-GuiStatus "Checking for available data sources..." ([System.Drawing.Color]::Orange)
@@ -5054,7 +5924,25 @@ function Invoke-CompromiseDetection {
     foreach ($source in $dataSources.GetEnumerator()) {
         $sourceName = $source.Key
         $sourceInfo = $source.Value
-        
+		
+        foreach ($sourceName in @('MFAStatusData', 'FailedLoginPatterns', 'PasswordChangeData')) {
+			$sourceInfo = $dataSources[$sourceName]
+			if (Test-Path $sourceInfo.Path) {
+				try {
+					$rawData = Import-Csv -Path $sourceInfo.Path
+					if ($rawData) {
+						$sourceInfo.Data = $rawData
+						$sourceInfo.Available = $true
+						$availableDataSources += $sourceName
+						Write-Log "Loaded ${sourceName}: $($rawData.Count) records" -Level "Info"
+					}
+				}
+				catch {
+					Write-Log "Error loading ${sourceName}: $($_.Exception.Message)" -Level "Warning"
+			}
+		}
+		
+	}
         if (Test-Path -Path $sourceInfo.Path) {
             try {
                 $rawData = Import-Csv -Path $sourceInfo.Path -ErrorAction Stop
@@ -5426,6 +6314,147 @@ function Invoke-CompromiseDetection {
             $users[$userId].RiskScore += $riskScore
         }
     }
+	
+	# Process MFA status data
+	if ($dataSources.MFAStatusData.Available) {
+		Update-GuiStatus "Analyzing MFA status data..." ([System.Drawing.Color]::Orange)
+		
+		foreach ($mfaRecord in $dataSources.MFAStatusData.Data) {
+			$userId = $mfaRecord.UserPrincipalName
+			if ([string]::IsNullOrEmpty($userId)) { continue }
+			
+			if (-not $users.ContainsKey($userId)) {
+				$users[$userId] = @{
+					UserDisplayName = $mfaRecord.DisplayName
+					UnusualSignIns = @()
+					FailedSignIns = @()
+					HighRiskOps = @()
+					SuspiciousRules = @()
+					SuspiciousDelegations = @()
+					HighRiskAppRegs = @()
+					ETRSpamActivity = @()
+					RiskScore = 0
+					MFAStatus = $null          
+					FailedLoginPatterns = @()  
+					PasswordChangeIssues = @() 
+				}
+			}
+			
+			# FIX: Ensure we store ONLY a single string value, force to string
+			$mfaValue = $mfaRecord.HasMFA
+			
+			# Normalize to a single string value
+			if ($mfaValue -eq "Yes" -or $mfaValue -eq "True" -or $mfaValue -eq $true) {
+				$users[$userId].MFAStatus = "Yes"
+			}
+			elseif ($mfaValue -eq "No" -or $mfaValue -eq "False" -or $mfaValue -eq $false) {
+				$users[$userId].MFAStatus = "No"
+			}
+			else {
+				$users[$userId].MFAStatus = "Unknown"
+			}
+			
+			# Add risk for no MFA
+			if ($users[$userId].MFAStatus -eq "No") {
+				$users[$userId].RiskScore += 40
+			}
+			
+			# Extra risk if admin without MFA
+			if ($mfaRecord.RiskLevel -eq "Critical") {
+				$users[$userId].RiskScore += 10
+			}
+		}
+	}
+	# Process failed login patterns
+	if ($dataSources.FailedLoginPatterns.Available) {
+		Update-GuiStatus "Analyzing failed login patterns..." ([System.Drawing.Color]::Orange)
+		
+		foreach ($pattern in $dataSources.FailedLoginPatterns.Data) {
+			$details = $pattern.Details
+			if ([string]::IsNullOrEmpty($details)) { continue }
+			
+			# Extract user from Details field
+			if ($details -match "User\s+([^\s]+@[^\s]+)") {
+				$userId = $Matches[1]
+				
+				if (-not $users.ContainsKey($userId)) {
+					$users[$userId] = @{
+						UserDisplayName = $userId
+						UnusualSignIns = @()
+						FailedSignIns = @()
+						HighRiskOps = @()
+						SuspiciousRules = @()
+						SuspiciousDelegations = @()
+						HighRiskAppRegs = @()
+						ETRSpamActivity = @()
+						RiskScore = 0
+						MFAStatus = $null          # NEW
+						FailedLoginPatterns = @()  # NEW
+						PasswordChangeIssues = @() # NEW
+					}
+				}
+				
+				# STORE the pattern data
+				$users[$userId].FailedLoginPatterns += $pattern
+				
+				# Add risk based on pattern type
+				$riskLevel = $pattern.RiskLevel
+				$successfulBreach = $pattern.SuccessfulBreach
+				
+				if ($successfulBreach -eq "True" -or $successfulBreach -eq $true) {
+					$users[$userId].RiskScore += 50
+				}
+				elseif ($riskLevel -eq "Critical") {
+					$users[$userId].RiskScore += 30
+				}
+				elseif ($riskLevel -eq "High") {
+					$users[$userId].RiskScore += 20
+				}
+				elseif ($riskLevel -eq "Medium") {
+					$users[$userId].RiskScore += 10
+				}
+			}
+		}
+	}
+
+	# Process password change patterns
+	if ($dataSources.PasswordChangeData.Available) {
+		Update-GuiStatus "Analyzing password change patterns..." ([System.Drawing.Color]::Orange)
+		
+		foreach ($pwChange in $dataSources.PasswordChangeData.Data) {
+			$userId = $pwChange.User
+			if ([string]::IsNullOrEmpty($userId)) { continue }
+			
+			if (-not $users.ContainsKey($userId)) {
+				$users[$userId] = @{
+					UserDisplayName = $userId
+					UnusualSignIns = @()
+					FailedSignIns = @()
+					HighRiskOps = @()
+					SuspiciousRules = @()
+					SuspiciousDelegations = @()
+					HighRiskAppRegs = @()
+					ETRSpamActivity = @()
+					RiskScore = 0
+					MFAStatus = $null          # NEW
+					FailedLoginPatterns = @()  # NEW
+					PasswordChangeIssues = @() # NEW
+				}
+			}
+			
+			# STORE the password change data
+			$users[$userId].PasswordChangeIssues += $pwChange
+			
+			# Add risk score
+			try {
+				$pwRiskScore = [int]$pwChange.RiskScore
+				$users[$userId].RiskScore += $pwRiskScore
+			}
+			catch {
+				Write-Log "Could not parse RiskScore for password change: $($pwChange.User)" -Level "Warning"
+			}
+		}
+	}
     
     # Calculate risk levels and create results
     Update-GuiStatus "Calculating risk scores..." ([System.Drawing.Color]::Orange)
@@ -5461,6 +6490,11 @@ function Invoke-CompromiseDetection {
             SuspiciousDelegations = $userData.SuspiciousDelegations
             HighRiskAppRegistrations = $userData.HighRiskAppRegs
             ETRSpamActivity = $userData.ETRSpamActivity
+			MFAStatus = if ($userData.MFAStatus) { $userData.MFAStatus } else { "Unknown" }
+			FailedLoginPatternCount = if ($userData.FailedLoginPatterns) { $userData.FailedLoginPatterns.Count } else { 0 }
+			FailedLoginPatterns = if ($userData.FailedLoginPatterns) { $userData.FailedLoginPatterns } else { @() }
+			PasswordChangeIssuesCount = if ($userData.PasswordChangeIssues) { $userData.PasswordChangeIssues.Count } else { 0 }
+			PasswordChangeIssues = if ($userData.PasswordChangeIssues) { $userData.PasswordChangeIssues } else { @() }
         }
         
         $results += $resultObject
@@ -5549,7 +6583,7 @@ function Generate-HTMLReport {
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
             background-color: #fff;
             padding: 30px;
@@ -5558,203 +6592,292 @@ function Generate-HTMLReport {
         }
         
         h1 {
-            color: #0078d4;
-            border-bottom: 3px solid #0078d4;
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
             padding-bottom: 10px;
-            margin-bottom: 20px;
+            margin-bottom: 30px;
         }
         
         h2 {
-            color: #0078d4;
+            color: #34495e;
             margin-top: 30px;
             margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #ecf0f1;
         }
         
         h3 {
-            color: #0078d4;
+            color: #2c3e50;
             margin-top: 20px;
             margin-bottom: 10px;
+            display: flex;
+            align-items: center;
         }
         
-        .metadata {
-            background-color: #e3f2fd;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            border-left: 5px solid #2196f3;
+        .icon {
+            margin-right: 8px;
+            font-size: 1.2em;
         }
         
-        .metadata strong {
-            color: #1976d2;
-        }
-        
-        .summary-box {
+        .summary-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
             margin-bottom: 30px;
         }
         
         .summary-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
             padding: 20px;
             border-radius: 8px;
-            text-align: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            transition: transform 0.2s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
         
-        .summary-item:hover {
-            transform: translateY(-5px);
+        .summary-item.critical {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        
+        .summary-item.high {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+        }
+        
+        .summary-item.medium {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        
+        .summary-item.low {
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
         }
         
         .summary-item h3 {
-            margin: 0 0 10px 0;
-            font-size: 1.2em;
+            font-size: 1.8em;
+            margin: 0;
+            color: white;
+            border: none;
         }
         
         .summary-item p {
-            font-size: 2em;
-            font-weight: bold;
+            font-size: 3em;
             margin: 10px 0;
+            font-weight: bold;
         }
         
         .summary-item small {
-            display: block;
-            margin-top: 5px;
             opacity: 0.9;
+            font-size: 0.9em;
         }
         
-        .critical {
-            background: linear-gradient(135deg, #d13438, #ff6b6b);
-            color: white;
-        }
-        
-        .high {
-            background: linear-gradient(135deg, #ff8c00, #ffa500);
-            color: white;
-        }
-        
-        .medium {
-            background: linear-gradient(135deg, #fce100, #ffed4e);
-            color: #333;
-        }
-        
-        .low {
-            background: linear-gradient(135deg, #107c10, #4caf50);
-            color: white;
+        /* Make tables horizontally scrollable */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 20px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         }
         
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 30px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            background-color: white;
+            font-size: 13px;
+            min-width: 1400px;
+        }
+        
+        thead {
+            background-color: #2c3e50;
+            color: white;
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
         
         th, td {
-            padding: 12px 15px;
+            padding: 10px 8px;
             text-align: left;
             border-bottom: 1px solid #ddd;
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         
-        th {
-            background: linear-gradient(135deg, #0078d4, #106ebe);
-            color: white;
+        /* First column (User ID) - sticky and wider */
+        th:first-child, td:first-child {
+            max-width: 220px;
+            position: sticky;
+            left: 0;
+            background-color: white;
+            z-index: 5;
             font-weight: 600;
         }
         
-        tr:hover {
-            background-color: #f8f9fa;
+        thead th:first-child {
+            background-color: #2c3e50;
+            z-index: 15;
         }
         
-        tr:nth-child(even) {
+        /* Numeric columns - narrower and centered */
+        td:nth-child(3), td:nth-child(5), td:nth-child(6), td:nth-child(7),
+        td:nth-child(8), td:nth-child(9), td:nth-child(10), td:nth-child(11),
+        td:nth-child(12), td:nth-child(13) {
+            text-align: center;
+            max-width: 80px;
+        }
+        
+        th:nth-child(3), th:nth-child(5), th:nth-child(6), th:nth-child(7),
+        th:nth-child(8), th:nth-child(9), th:nth-child(10), th:nth-child(11),
+        th:nth-child(12), th:nth-child(13) {
+            text-align: center;
+        }
+        
+        /* MFA Status column */
+        td:nth-child(4), th:nth-child(4) {
+            text-align: center;
+            max-width: 70px;
+        }
+        
+        /* Risk Level column */
+        td:nth-child(2), th:nth-child(2) {
+            max-width: 100px;
+        }
+        
+        /* Allow hover to show full content */
+        td:hover {
+            overflow: visible;
+            white-space: normal;
+            position: relative;
+            z-index: 20;
             background-color: #f9f9f9;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        
+        tbody tr:nth-child(even) {
+            background-color: #fafafa;
         }
         
         .risk-badge {
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.8em;
-            font-weight: bold;
             display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-weight: bold;
+            font-size: 0.85em;
+            text-transform: uppercase;
         }
         
-        .risk-critical { background-color: #d13438; color: white; }
-        .risk-high { background-color: #ff8c00; color: white; }
-        .risk-medium { background-color: #fce100; color: #333; }
-        .risk-low { background-color: #107c10; color: white; }
+        .risk-critical {
+            background-color: #e74c3c;
+            color: white;
+        }
+        
+        .risk-high {
+            background-color: #e67e22;
+            color: white;
+        }
+        
+        .risk-medium {
+            background-color: #f39c12;
+            color: white;
+        }
+        
+        .risk-low {
+            background-color: #27ae60;
+            color: white;
+        }
         
         .collapsible {
-            background: linear-gradient(135deg, #0078d4, #106ebe);
+            background-color: #2c3e50;
             color: white;
             cursor: pointer;
-            padding: 18px 20px;
+            padding: 18px;
             width: 100%;
             border: none;
             text-align: left;
             outline: none;
             font-size: 16px;
-            margin-top: 15px;
-            border-radius: 8px;
-            font-weight: 600;
-            transition: all 0.3s ease;
+            margin-top: 10px;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         
-        .active, .collapsible:hover {
-            background: linear-gradient(135deg, #005a9e, #0078d4);
-            transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(0,120,212,0.3);
+        .collapsible:hover {
+            background-color: #34495e;
+        }
+        
+        .collapsible.active {
+            background-color: #34495e;
         }
         
         .content {
-            padding: 0 20px;
+            padding: 0 18px;
             display: none;
             overflow: hidden;
             background-color: #f9f9f9;
-            border-radius: 0 0 8px 8px;
+            border-left: 3px solid #3498db;
+            margin-bottom: 10px;
         }
         
         .detail-section {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: white;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        
+        .detail-section table {
+            margin-top: 10px;
+            min-width: 100%;
+        }
+        
+        .detail-section th {
+            background-color: #34495e;
+        }
+        
+        .metadata {
+            background-color: #ecf0f1;
+            padding: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #3498db;
             margin-top: 20px;
-            padding: 20px;
-            background-color: #ffffff;
-            border-left: 5px solid #0078d4;
-            border-radius: 0 8px 8px 0;
-            margin-bottom: 15px;
         }
         
-        .icon {
-            margin-right: 8px;
+        .timestamp {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            text-align: right;
+            margin-top: 30px;
         }
         
-        @media print {
-            .collapsible { display: none; }
-            .content { display: block !important; }
-        }
+        /* MFA status indicators */
+        .mfa-yes { color: #27ae60; font-weight: bold; font-size: 1.2em; }
+        .mfa-no { color: #e74c3c; font-weight: bold; font-size: 1.2em; }
+        .mfa-unknown { color: #f39c12; font-weight: bold; font-size: 1.2em; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔒 Microsoft 365 Security Analysis Report</h1>
+        <p class="timestamp">Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</p>
         
-        <div class="metadata">
-            <strong>Report Generated:</strong> $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")<br>
-            <strong>Analysis Engine:</strong> Enhanced Microsoft Graph PowerShell Module<br>
-            <strong>Script Version:</strong> $ScriptVer<br>
-            <strong>Analyzed Tenant:</strong> $($Global:ConnectionState.TenantName) ($($Global:ConnectionState.TenantId))<br>
-            <strong>Connected As:</strong> $($Global:ConnectionState.Account)
-        </div>
-        
-        <div class="summary-box">
+        <div class="summary-grid">
             <div class="summary-item critical">
                 <h3><span class="icon">🚨</span>Critical Risk</h3>
                 <p>$($criticalUsers.Count)</p>
-                <small>Users requiring immediate attention</small>
+                <small>Users requiring immediate action</small>
             </div>
             <div class="summary-item high">
                 <h3><span class="icon">⚠️</span>High Risk</h3>
                 <p>$($highRiskUsers.Count)</p>
-                <small>Users with elevated risk indicators</small>
+                <small>Users needing urgent review</small>
             </div>
             <div class="summary-item medium">
                 <h3><span class="icon">⚡</span>Medium Risk</h3>
@@ -5769,46 +6892,66 @@ function Generate-HTMLReport {
         </div>
         
         <h2>Executive Risk Summary</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>User ID</th>
-                    <th>Risk Level</th>
-                    <th>Risk Score</th>
-                    <th>Unusual Locations</th>
-                    <th>Failed Sign-ins</th>
-                    <th>Admin Operations</th>
-                    <th>Suspicious Rules</th>
-                    <th>Delegations</th>
-                    <th>Risky Apps</th>
-                    <th>Spam Activity</th>
-                </tr>
-            </thead>
-            <tbody>
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>User ID</th>
+                        <th>Risk Level</th>
+                        <th>Risk Score</th>
+                        <th>MFA</th>
+                        <th>Unusual Locations</th>
+                        <th>Failed Sign-ins</th>
+                        <th>Attack Patterns</th>
+                        <th>Password Issues</th>
+                        <th>Admin Ops</th>
+                        <th>Suspicious Rules</th>
+                        <th>Delegations</th>
+                        <th>Risky Apps</th>
+                        <th>Spam Activity</th>
+                    </tr>
+                </thead>
+                <tbody>
 "@
 
-    # Add summary rows for all users
-    foreach ($user in $Data) {
-        $riskClass = "risk-" + $user.RiskLevel.ToLower()
-        $html += @"
-                <tr>
-                    <td><strong>$($user.UserId)</strong></td>
-                    <td><span class="risk-badge $riskClass">$($user.RiskLevel)</span></td>
-                    <td><strong>$($user.RiskScore)</strong></td>
-                    <td>$($user.UnusualSignInCount)</td>
-                    <td>$($user.FailedSignInCount)</td>
-                    <td>$($user.HighRiskOperationsCount)</td>
-                    <td>$($user.SuspiciousRulesCount)</td>
-                    <td>$($user.SuspiciousDelegationsCount)</td>
-                    <td>$($user.HighRiskAppRegistrationsCount)</td>
-                    <td>$($user.ETRSpamActivityCount)</td>
-                </tr>
+	# Add summary rows for all users
+	foreach ($user in $Data) {
+		$riskClass = "risk-" + $user.RiskLevel.ToLower()
+		
+		# FIX: Ensure MFA display is a single value, convert to string first
+		$mfaStatusValue = [string]$user.MFAStatus
+		
+		$mfaDisplay = switch -Exact ($mfaStatusValue) {
+			"Yes"     { '<span class="mfa-yes">✅</span>' }
+			"True"    { '<span class="mfa-yes">✅</span>' }
+			"No"      { '<span class="mfa-no">❌</span>' }
+			"False"   { '<span class="mfa-no">❌</span>' }
+			default   { '<span class="mfa-unknown">❓</span>' }
+		}
+		
+		$html += @"
+				<tr>
+					<td><strong>$($user.UserId)</strong></td>
+					<td><span class="risk-badge $riskClass">$($user.RiskLevel)</span></td>
+					<td><strong>$($user.RiskScore)</strong></td>
+					<td>$mfaDisplay</td>
+					<td>$($user.UnusualSignInCount)</td>
+					<td>$($user.FailedSignInCount)</td>
+					<td>$($user.FailedLoginPatternCount)</td>
+					<td>$($user.PasswordChangeIssuesCount)</td>
+					<td>$($user.HighRiskOperationsCount)</td>
+					<td>$($user.SuspiciousRulesCount)</td>
+					<td>$($user.SuspiciousDelegationsCount)</td>
+					<td>$($user.HighRiskAppRegistrationsCount)</td>
+					<td>$($user.ETRSpamActivityCount)</td>
+				</tr>
 "@
-    }
+	}
 
     $html += @"
-            </tbody>
-        </table>
+                </tbody>
+            </table>
+        </div>
         
         <h2>Detailed Security Analysis</h2>
         <p style="color: #666; margin-bottom: 20px;">
@@ -5832,63 +6975,186 @@ function Generate-HTMLReport {
         <div class="content">
 "@
 
+        # MFA Status Section
+        if ($user.MFAStatus -and $user.MFAStatus -ne "Unknown") {
+            $mfaStatusClass = switch ($user.MFAStatus) {
+                "No"    { "mfa-no" }
+                "False" { "mfa-no" }
+                $false  { "mfa-no" }
+                "Yes"   { "mfa-yes" }
+                "True"  { "mfa-yes" }
+                $true   { "mfa-yes" }
+                default { "mfa-unknown" }
+            }
+            
+            $mfaMessage = switch ($user.MFAStatus) {
+                "No"    { "⚠️ MFA NOT ENABLED - Account is vulnerable" }
+                "False" { "⚠️ MFA NOT ENABLED - Account is vulnerable" }
+                $false  { "⚠️ MFA NOT ENABLED - Account is vulnerable" }
+                "Yes"   { "✅ MFA Enabled - Account protected" }
+                "True"  { "✅ MFA Enabled - Account protected" }
+                $true   { "✅ MFA Enabled - Account protected" }
+                default { "❓ MFA Status Unknown" }
+            }
+            
+            $html += @"
+            <div class="detail-section">
+                <h3><span class="icon">🔐</span>Multi-Factor Authentication Status</h3>
+                <p class="$mfaStatusClass" style="font-size: 1.1em; padding: 10px; background-color: #f8f9fa; border-radius: 4px;">
+                    <strong>$mfaMessage</strong>
+                </p>
+            </div>
+"@
+        }
+
+        # Failed Login Attack Patterns Section
+        if ($user.FailedLoginPatternCount -gt 0 -and $user.FailedLoginPatterns) {
+            $html += @"
+            <div class="detail-section">
+                <h3><span class="icon">🚨</span>Failed Login Attack Patterns Detected</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pattern Type</th>
+                                <th>Source IP</th>
+                                <th>Location</th>
+                                <th>ISP</th>
+                                <th>Failed Attempts</th>
+                                <th>Time Span (hrs)</th>
+                                <th>Risk Level</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"@
+            foreach ($pattern in $user.FailedLoginPatterns) {
+                $patternRiskClass = "risk-" + $pattern.RiskLevel.ToLower()
+                $html += @"
+                        <tr>
+                            <td><strong>$($pattern.PatternType)</strong></td>
+                            <td>$($pattern.SourceIP)</td>
+                            <td>$($pattern.Location)</td>
+                            <td>$($pattern.ISP)</td>
+                            <td style="text-align: center;"><strong>$($pattern.FailedAttempts)</strong></td>
+                            <td style="text-align: center;">$($pattern.TimeSpan)</td>
+                            <td><span class="risk-badge $patternRiskClass">$($pattern.RiskLevel)</span></td>
+                            <td>$($pattern.Details)</td>
+                        </tr>
+"@
+            }
+            $html += @"
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+"@
+        }
+
+        # Password Change Issues Section
+        if ($user.PasswordChangeIssuesCount -gt 0 -and $user.PasswordChangeIssues) {
+            $html += @"
+            <div class="detail-section">
+                <h3><span class="icon">🔑</span>Suspicious Password Change Activity</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Change Count</th>
+                                <th>Time Span</th>
+                                <th>First Change</th>
+                                <th>Last Change</th>
+                                <th>Unique Initiators</th>
+                                <th>Off-Hours Changes</th>
+                                <th>Risk Level</th>
+                                <th>Suspicious Reasons</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"@
+            foreach ($pwChange in $user.PasswordChangeIssues) {
+                $pwRiskClass = "risk-" + $pwChange.RiskLevel.ToLower()
+                $html += @"
+                        <tr>
+                            <td style="text-align: center;"><strong>$($pwChange.ChangeCount)</strong></td>
+                            <td style="text-align: center;">$($pwChange.TimeSpanHours) hours</td>
+                            <td>$($pwChange.FirstChange)</td>
+                            <td>$($pwChange.LastChange)</td>
+                            <td style="text-align: center;">$($pwChange.UniqueInitiators)</td>
+                            <td style="text-align: center;">$($pwChange.OffHoursChanges)</td>
+                            <td><span class="risk-badge $pwRiskClass">$($pwChange.RiskLevel)</span></td>
+                            <td>$($pwChange.SuspiciousReasons)</td>
+                        </tr>
+"@
+            }
+            $html += @"
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+"@
+        }
+
         # Unusual Sign-Ins Section
         if ($user.UnusualSignInCount -gt 0 -and $user.UnusualSignIns) {
             $html += @"
             <div class="detail-section">
                 <h3><span class="icon">🌍</span>Unusual Sign-In Locations</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date/Time</th>
-                            <th>IP Address</th>
-                            <th>Location</th>
-                            <th>Country</th>
-                            <th>Risk Level</th>
-                            <th>Application</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date/Time</th>
+                                <th>IP Address</th>
+                                <th>City</th>
+                                <th>Region</th>
+                                <th>Country</th>
+                                <th>ISP</th>
+                                <th>Application</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($signIn in $user.UnusualSignIns) {
                 $html += @"
                         <tr>
                             <td>$(if ($signIn.CreationTime) { $signIn.CreationTime } else { "N/A" })</td>
                             <td>$(if ($signIn.IP) { $signIn.IP } else { "N/A" })</td>
-                            <td>$(if ($signIn.City) { $signIn.City } else { "Unknown" }), $(if ($signIn.RegionName) { $signIn.RegionName } else { "Unknown" })</td>
-                            <td>$(if ($signIn.Country) { $signIn.Country } else { "Unknown" })</td>
-                            <td>$(if ($signIn.RiskLevel) { $signIn.RiskLevel } else { "Unknown" })</td>
+                            <td>$(if ($signIn.City) { $signIn.City } else { "Unknown" })</td>
+                            <td>$(if ($signIn.RegionName) { $signIn.RegionName } else { "Unknown" })</td>
+                            <td><strong>$(if ($signIn.Country) { $signIn.Country } else { "Unknown" })</strong></td>
+                            <td>$(if ($signIn.ISP) { $signIn.ISP } else { "Unknown" })</td>
                             <td>$(if ($signIn.AppDisplayName) { $signIn.AppDisplayName } else { "Unknown" })</td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         # Failed Sign-Ins Section
         if ($user.FailedSignInCount -gt 0 -and $user.FailedSignIns) {
-            $failedSignInsToShow = @($user.FailedSignIns | Select-Object -First 10)
             $html += @"
             <div class="detail-section">
-                <h3><span class="icon">⛔</span>Failed Sign-In Attempts</h3>
-                <p style="color: #666; margin-bottom: 10px;">Showing first 10 of $($user.FailedSignInCount) failed attempts</p>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date/Time</th>
-                            <th>IP Address</th>
-                            <th>Location</th>
-                            <th>Failure Reason</th>
-                            <th>Application</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <h3><span class="icon">❌</span>Failed Sign-In Attempts</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date/Time</th>
+                                <th>IP Address</th>
+                                <th>Location</th>
+                                <th>Failure Reason</th>
+                                <th>Application</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
-            foreach ($signIn in $failedSignInsToShow) {
+            foreach ($signIn in $user.FailedSignIns) {
                 $html += @"
                         <tr>
                             <td>$(if ($signIn.CreationTime) { $signIn.CreationTime } else { "N/A" })</td>
@@ -5900,176 +7166,203 @@ function Generate-HTMLReport {
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         # High-Risk Operations Section
         if ($user.HighRiskOperationsCount -gt 0 -and $user.HighRiskOperations) {
             $html += @"
             <div class="detail-section">
                 <h3><span class="icon">⚙️</span>High-Risk Administrative Operations</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date/Time</th>
-                            <th>Activity</th>
-                            <th>Result</th>
-                            <th>Category</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date/Time</th>
+                                <th>Activity</th>
+                                <th>Initiated By</th>
+                                <th>Target</th>
+                                <th>Result</th>
+                                <th>Risk Level</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($op in $user.HighRiskOperations) {
+                $opRiskClass = "risk-" + $op.RiskLevel.ToLower()
                 $html += @"
                         <tr>
-                            <td>$(if ($op.Timestamp) { $op.Timestamp } else { "N/A" })</td>
-                            <td>$(if ($op.Activity) { $op.Activity } else { "N/A" })</td>
-                            <td>$(if ($op.Result) { $op.Result } else { "N/A" })</td>
-                            <td>$(if ($op.Category) { $op.Category } else { "N/A" })</td>
+                            <td>$(if ($op.ActivityDate) { $op.ActivityDate } else { "N/A" })</td>
+                            <td><strong>$(if ($op.Activity) { $op.Activity } else { "Unknown" })</strong></td>
+                            <td>$(if ($op.InitiatedBy) { $op.InitiatedBy } else { "Unknown" })</td>
+                            <td>$(if ($op.TargetUser) { $op.TargetUser } else { "N/A" })</td>
+                            <td>$(if ($op.Result) { $op.Result } else { "Unknown" })</td>
+                            <td><span class="risk-badge $opRiskClass">$($op.RiskLevel)</span></td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
-        # Suspicious Inbox Rules Section
+
+        # Suspicious Rules Section
         if ($user.SuspiciousRulesCount -gt 0 -and $user.SuspiciousRules) {
             $html += @"
             <div class="detail-section">
-                <h3><span class="icon">📧</span>Suspicious Inbox Rules</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Rule Name</th>
-                            <th>Enabled</th>
-                            <th>Suspicious Reasons</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <h3><span class="icon">📧</span>Suspicious Mailbox Rules</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rule Name</th>
+                                <th>Enabled</th>
+                                <th>Forward To</th>
+                                <th>Move To Folder</th>
+                                <th>Delete Message</th>
+                                <th>Stop Processing</th>
+                                <th>Suspicious Reasons</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($rule in $user.SuspiciousRules) {
                 $html += @"
                         <tr>
-                            <td>$(if ($rule.RuleName) { $rule.RuleName } else { "N/A" })</td>
-                            <td>$(if ($rule.IsEnabled) { $rule.IsEnabled } else { "N/A" })</td>
+                            <td><strong>$(if ($rule.Name) { $rule.Name } else { "Unnamed" })</strong></td>
+                            <td>$(if ($rule.IsEnabled -eq "True") { "✅ Yes" } else { "❌ No" })</td>
+                            <td>$(if ($rule.ForwardTo) { $rule.ForwardTo } else { "-" })</td>
+                            <td>$(if ($rule.MoveToFolder) { $rule.MoveToFolder } else { "-" })</td>
+                            <td>$(if ($rule.DeleteMessage -eq "True") { "⚠️ Yes" } else { "No" })</td>
+                            <td>$(if ($rule.StopProcessingRules -eq "True") { "⚠️ Yes" } else { "No" })</td>
                             <td>$(if ($rule.SuspiciousReasons) { $rule.SuspiciousReasons } else { "N/A" })</td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         # Suspicious Delegations Section
         if ($user.SuspiciousDelegationsCount -gt 0 -and $user.SuspiciousDelegations) {
             $html += @"
             <div class="detail-section">
                 <h3><span class="icon">👥</span>Suspicious Mailbox Delegations</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Delegate Name</th>
-                            <th>Delegate Email</th>
-                            <th>Permissions</th>
-                            <th>Reasons</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Delegate</th>
+                                <th>Permissions</th>
+                                <th>Suspicious Reasons</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($delegation in $user.SuspiciousDelegations) {
                 $html += @"
                         <tr>
-                            <td>$(if ($delegation.DelegateName) { $delegation.DelegateName } else { "N/A" })</td>
-                            <td>$(if ($delegation.DelegateEmail) { $delegation.DelegateEmail } else { "N/A" })</td>
+                            <td><strong>$(if ($delegation.Delegate) { $delegation.Delegate } else { "Unknown" })</strong></td>
                             <td>$(if ($delegation.Permissions) { $delegation.Permissions } else { "N/A" })</td>
                             <td>$(if ($delegation.SuspiciousReasons) { $delegation.SuspiciousReasons } else { "N/A" })</td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         # High-Risk App Registrations Section
         if ($user.HighRiskAppRegistrationsCount -gt 0 -and $user.HighRiskAppRegistrations) {
             $html += @"
             <div class="detail-section">
-                <h3><span class="icon">🔧</span>High-Risk Application Registrations</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Application Name</th>
-                            <th>Created</th>
-                            <th>Publisher</th>
-                            <th>Risk Reasons</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <h3><span class="icon">📱</span>High-Risk Application Registrations</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>App Name</th>
+                                <th>App ID</th>
+                                <th>Created Date</th>
+                                <th>Risk Level</th>
+                                <th>Risk Reasons</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($app in $user.HighRiskAppRegistrations) {
+                $appRiskClass = "risk-" + $app.RiskLevel.ToLower()
                 $html += @"
                         <tr>
-                            <td>$(if ($app.DisplayName) { $app.DisplayName } else { "N/A" })</td>
+                            <td><strong>$(if ($app.DisplayName) { $app.DisplayName } else { "Unknown" })</strong></td>
+                            <td>$(if ($app.AppId) { $app.AppId } else { "N/A" })</td>
                             <td>$(if ($app.CreatedDateTime) { $app.CreatedDateTime } else { "N/A" })</td>
-                            <td>$(if ($app.PublisherDomain) { $app.PublisherDomain } else { "N/A" })</td>
+                            <td><span class="risk-badge $appRiskClass">$($app.RiskLevel)</span></td>
                             <td>$(if ($app.RiskReasons) { $app.RiskReasons } else { "N/A" })</td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         # ETR Spam Activity Section
         if ($user.ETRSpamActivityCount -gt 0 -and $user.ETRSpamActivity) {
             $html += @"
             <div class="detail-section">
-                <h3><span class="icon">📨</span>Spam/Mass Email Activity</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Risk Type</th>
-                            <th>Risk Level</th>
-                            <th>Message Count</th>
-                            <th>Description</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+                <h3><span class="icon">📨</span>Email Spam Activity Detected</h3>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pattern Type</th>
+                                <th>Message Count</th>
+                                <th>Risk Score</th>
+                                <th>Risk Level</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
 "@
             foreach ($spam in $user.ETRSpamActivity) {
-                $spamRiskClass = if ($spam.RiskLevel) { "risk-" + $spam.RiskLevel.ToLower() } else { "risk-low" }
+                $spamRiskClass = "risk-" + $spam.RiskLevel.ToLower()
                 $html += @"
                         <tr>
-                            <td>$(if ($spam.RiskType) { $spam.RiskType } else { "N/A" })</td>
-                            <td><span class="risk-badge $spamRiskClass">$(if ($spam.RiskLevel) { $spam.RiskLevel } else { "N/A" })</span></td>
-                            <td>$(if ($spam.MessageCount) { $spam.MessageCount } else { "N/A" })</td>
-                            <td>$(if ($spam.Description) { $spam.Description } else { "N/A" })</td>
+                            <td><strong>$(if ($spam.PatternType) { $spam.PatternType } else { "Unknown" })</strong></td>
+                            <td style="text-align: center;">$(if ($spam.MessageCount) { $spam.MessageCount } else { "0" })</td>
+                            <td style="text-align: center;"><strong>$(if ($spam.RiskScore) { $spam.RiskScore } else { "0" })</strong></td>
+                            <td><span class="risk-badge $spamRiskClass">$(if ($spam.RiskLevel) { $spam.RiskLevel } else { "Unknown" })</span></td>
+                            <td>$(if ($spam.Details) { $spam.Details } else { "N/A" })</td>
                         </tr>
 "@
             }
             $html += @"
-                    </tbody>
-                </table>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 "@
         }
-        
+
         $html += @"
         </div>
 "@
@@ -6078,7 +7371,6 @@ function Generate-HTMLReport {
     $html += @"
         
         <script>
-            // Collapsible sections functionality
             var coll = document.getElementsByClassName("collapsible");
             var i;
             
@@ -6111,8 +7403,10 @@ function Generate-HTMLReport {
             • Risk scores are calculated based on multiple security indicators<br>
             • Critical and High risk users are automatically expanded in the detailed analysis<br>
             • Review all suspicious activities for potential compromise indicators<br>
-            • Performance optimizations include IP caching and batch processing<br>
-            • ETR analysis includes spam pattern detection and message correlation
+            • MFA status indicates multi-factor authentication enrollment<br>
+            • Attack patterns require 5+ failed logins from same IP for breach confirmation<br>
+            • Password change analysis detects suspicious reset patterns<br>
+            • Performance optimizations include IP caching and batch processing
         </div>
     </div>
 </body>
@@ -6121,6 +7415,7 @@ function Generate-HTMLReport {
 
     return $html
 }
+
 
 #endregion
 
@@ -6697,6 +7992,9 @@ function Show-MainGUI {
             @{Name="Sign-In Data"; Function="Get-TenantSignInData"},
             @{Name="Admin Audits"; Function="Get-AdminAuditData"},
             @{Name="Inbox Rules"; Function="Get-MailboxRules"},
+			@{Name="MFA Status Audit"; Function="Get-MFAStatusAudit"},
+            @{Name="Failed Login Analysis"; Function="Get-FailedLoginPatterns"},
+            @{Name="Password Change Analysis"; Function="Get-RecentPasswordChanges"}
             @{Name="Delegations"; Function="Get-MailboxDelegationData"},
             @{Name="App Registrations"; Function="Get-AppRegistrationData"},
             @{Name="Conditional Access"; Function="Get-ConditionalAccessData"},
@@ -6716,6 +8014,9 @@ function Show-MainGUI {
                     "Get-TenantSignInData" { Get-TenantSignInData | Out-Null }
                     "Get-AdminAuditData" { Get-AdminAuditData | Out-Null }
                     "Get-MailboxRules" { Get-MailboxRules | Out-Null }
+					"Get-MFAStatusAudit" { Get-MFAStatusAudit | Out-Null }
+					"Get-FailedLoginPatterns" { Get-FailedLoginPatterns | Out-Null }
+					"Get-RecentPasswordChanges" { Get-RecentPasswordChanges | Out-Null }
                     "Get-MailboxDelegationData" { Get-MailboxDelegationData | Out-Null }
                     "Get-AppRegistrationData" { Get-AppRegistrationData | Out-Null }
                     "Get-ConditionalAccessData" { Get-ConditionalAccessData | Out-Null }
