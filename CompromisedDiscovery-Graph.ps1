@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "9.9"
+$ScriptVer = "10.0"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -90,6 +90,26 @@ $Global:ExchangeOnlineState = @{
     LastChecked       = $null   # Last connection verification time
     ConnectionAttempts = 0      # Number of connection attempts (for retry logic)
 }
+
+#═══════════════════════════════════════════════════════════════════════════════
+# HIGH-RISK ISP DETECTION
+#═══════════════════════════════════════════════════════════════════════════════
+# List of Internet Service Providers associated with heightened security risk
+# These ISPs are commonly used by VPS/hosting providers and may indicate
+# suspicious activity when used for M365 sign-ins
+$script:HighRiskISPs = @(
+    "12651980 Canada Inc.",
+    "Aurologic Gmbh",
+    "Clouvider Limited",
+    "Datacamp Limited",
+    "Internet Utilities Europe and Asia Limited",
+    "latitude.sh",
+    "Mtn Nigeria Communication Limited",
+    "Packethub s.A.",
+    "Servers Australia Customers",
+    "m247 Europe Srl",
+    "Ovh Sas"
+)
 
 #══════════════════════════════════════════════════════════════════════════════
 # PACIFIC OFFICE THEME SYSTEM
@@ -3357,6 +3377,18 @@ function Get-TenantSignInData {
                 }
             }
             
+			# Check if ISP is in high-risk list
+			$isHighRiskISP = $false
+			if (-not [string]::IsNullOrEmpty($isp) -and $isp -ne "Unknown" -and $isp -ne "Private Network") {
+				foreach ($highRiskProvider in $script:HighRiskISPs) {
+					if ($isp -like "*$highRiskProvider*") {
+						$isHighRiskISP = $true
+						Write-Log "High-risk ISP detected: $isp for user $userDisplayName" -Level "Warning"
+						break
+					}
+				}
+			}
+			
             # Get sign-in status
             $statusCode = if ($signIn.Status -and $signIn.Status.ErrorCode) { 
                 $signIn.Status.ErrorCode.ToString() 
@@ -3378,6 +3410,7 @@ function Get-TenantSignInData {
                 RegionName = $region
                 Country = $country
                 ISP = $isp
+				IsHighRiskISP = $isHighRiskISP
                 IsUnusualLocation = $isUnusual
                 StatusCode = $statusCode
                 Status = $statusDescription
@@ -6923,6 +6956,7 @@ function Invoke-CompromiseDetection {
                     SuspiciousDelegations = @()
                     HighRiskAppRegs = @()
                     ETRSpamActivity = @()
+					HighRiskISPSignIns = @()
                     RiskScore = 0
                 }
             }
@@ -6944,6 +6978,13 @@ function Invoke-CompromiseDetection {
             if ($signIn.RiskLevel -and $signIn.RiskLevel -eq "high" -and $isSuccessfulSignIn) {
                 $users[$userId].RiskScore += 15
             }
+			
+			# Check for high-risk ISP sign-ins
+			$isHighRiskISP = ConvertTo-SafeBoolean $signIn.IsHighRiskISP
+			if ($isHighRiskISP -and $isSuccessfulSignIn) {
+				$users[$userId].HighRiskISPSignIns += $signIn
+				$users[$userId].RiskScore += 25  # Significant risk score for high-risk ISPs
+			}
         }
     }
     
@@ -6965,6 +7006,7 @@ function Invoke-CompromiseDetection {
                     SuspiciousDelegations = @()
                     HighRiskAppRegs = @()
                     ETRSpamActivity = @()
+					HighRiskISPSignIns = @()
                     RiskScore = 0
                 }
             }
@@ -6997,6 +7039,7 @@ function Invoke-CompromiseDetection {
                         SuspiciousDelegations = @()
                         HighRiskAppRegs = @()
                         ETRSpamActivity = @()
+						HighRiskISPSignIns = @()
                         RiskScore = 0
                     }
                 }
@@ -7028,6 +7071,7 @@ function Invoke-CompromiseDetection {
                         SuspiciousDelegations = @()
                         HighRiskAppRegs = @()
                         ETRSpamActivity = @()
+						HighRiskISPSignIns = @()
                         RiskScore = 0
                     }
                 }
@@ -7057,6 +7101,7 @@ function Invoke-CompromiseDetection {
                         SuspiciousDelegations = @()
                         HighRiskAppRegs = @()
                         ETRSpamActivity = @()
+						HighRiskISPSignIns = @()
                         RiskScore = 0
                     }
                 }
@@ -7095,6 +7140,7 @@ function Invoke-CompromiseDetection {
                     SuspiciousDelegations = @()
                     HighRiskAppRegs = @()
                     ETRSpamActivity = @()
+					HighRiskISPSignIns = @()
                     RiskScore = 0
                 }
             }
@@ -7126,6 +7172,7 @@ function Invoke-CompromiseDetection {
 					SuspiciousDelegations = @()
 					HighRiskAppRegs = @()
 					ETRSpamActivity = @()
+					HighRiskISPSignIns = @()
 					RiskScore = 0
 					MFAStatus = $null          
 					FailedLoginPatterns = @()  
@@ -7180,6 +7227,7 @@ function Invoke-CompromiseDetection {
 						SuspiciousDelegations = @()
 						HighRiskAppRegs = @()
 						ETRSpamActivity = @()
+						HighRiskISPSignIns = @()
 						RiskScore = 0
 						MFAStatus = $null          # NEW
 						FailedLoginPatterns = @()  # NEW
@@ -7228,6 +7276,7 @@ function Invoke-CompromiseDetection {
 					SuspiciousDelegations = @()
 					HighRiskAppRegs = @()
 					ETRSpamActivity = @()
+					HighRiskISPSignIns = @()
 					RiskScore = 0
 					MFAStatus = $null          # NEW
 					FailedLoginPatterns = @()  # NEW
@@ -7276,6 +7325,7 @@ function Invoke-CompromiseDetection {
             SuspiciousDelegationsCount = $userData.SuspiciousDelegations.Count
             HighRiskAppRegistrationsCount = $userData.HighRiskAppRegs.Count
             ETRSpamActivityCount = $userData.ETRSpamActivity.Count
+			HighRiskISPCount = $userData.HighRiskISPSignIns.Count
             UnusualSignIns = $userData.UnusualSignIns
             FailedSignIns = $userData.FailedSignIns
             HighRiskOperations = $userData.HighRiskOps
@@ -7283,6 +7333,7 @@ function Invoke-CompromiseDetection {
             SuspiciousDelegations = $userData.SuspiciousDelegations
             HighRiskAppRegistrations = $userData.HighRiskAppRegs
             ETRSpamActivity = $userData.ETRSpamActivity
+			HighRiskISPSignIns = $userData.HighRiskISPSignIns
 			MFAStatus = if ($userData.MFAStatus) { $userData.MFAStatus } else { "Unknown" }
 			FailedLoginPatternCount = if ($userData.FailedLoginPatterns) { $userData.FailedLoginPatterns.Count } else { 0 }
 			FailedLoginPatterns = if ($userData.FailedLoginPatterns) { $userData.FailedLoginPatterns } else { @() }
@@ -7639,7 +7690,56 @@ function Generate-HTMLReport {
         tr:hover {
             background-color: var(--background-color);
         }
-        
+        /* High-Risk Row Highlighting */
+		.high-risk-row {
+			background: linear-gradient(to right, rgba(255, 152, 0, 0.15), transparent) !important;
+			border-left: 4px solid var(--danger-color) !important;
+			font-weight: 500;
+		}
+
+		.high-risk-row:hover {
+			background: linear-gradient(to right, rgba(255, 152, 0, 0.25), var(--background-color)) !important;
+			box-shadow: 0 2px 8px rgba(255, 152, 0, 0.3);
+			transform: translateX(3px);
+			transition: all 0.2s ease;
+		}
+
+		/* High-Risk ISP Section Title */
+		.evidence-section h4.high-risk-title {
+			color: var(--danger-color);
+			border-left-color: var(--danger-color);
+		}
+
+		/* Recommendation Box Styling */
+		.recommendation-box {
+			margin-top: 15px;
+			padding: 12px 15px;
+			background-color: rgba(255, 152, 0, 0.1);
+			border-left: 4px solid var(--warning-color);
+			border-radius: 4px;
+			font-size: 0.9em;
+			line-height: 1.6;
+		}
+
+		.recommendation-box strong {
+			color: var(--warning-color);
+			display: block;
+			margin-bottom: 8px;
+			font-size: 1.05em;
+		}
+
+		/* Dark Mode Adjustments */
+		body.dark-mode .high-risk-row {
+			background: linear-gradient(to right, rgba(255, 167, 38, 0.2), transparent) !important;
+		}
+
+		body.dark-mode .high-risk-row:hover {
+			background: linear-gradient(to right, rgba(255, 167, 38, 0.3), rgba(255, 255, 255, 0.02)) !important;
+		}
+
+		body.dark-mode .recommendation-box {
+			background-color: rgba(255, 167, 38, 0.15);
+		}
         /* BADGES & ALERTS */
         .badge {
             display: inline-block;
@@ -7779,7 +7879,7 @@ function Generate-HTMLReport {
 "@
     }
 
-    if ($highCount -gt 0) {
+if ($highCount -gt 0) {
         $html += @"
         <div class="alert warning">
             <strong>⚠️ WARNING:</strong> $highCount user(s) identified with high security risks requiring review.
@@ -7798,7 +7898,64 @@ function Generate-HTMLReport {
         }
     }}, RiskScore -Descending
 
+    # Add User Summary Table
     $html += @"
+        <div class="users-section">
+            <h2 class="section-title">👥 User Summary Overview</h2>
+            <div class="evidence-section">
+                <table class="summary-table">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Email</th>
+                            <th>Risk Level</th>
+                            <th>Risk Score</th>
+                            <th>MFA Status</th>
+                            <th>Key Indicators</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+
+    foreach ($user in $sortedData) {
+        $riskClass = $user.RiskLevel.ToLower()
+        $mfaStatus = if ($user.MFAStatus) { $user.MFAStatus } else { "Unknown" }
+        $mfaBadgeClass = switch ($mfaStatus) {
+            "Yes" { "success" }
+            "No" { "danger" }
+            default { "info" }
+        }
+        
+        # Build key indicators summary
+        $indicators = @()
+        if ($user.UnusualSignInCount -gt 0) { $indicators += "🌍 Unusual Locations ($($user.UnusualSignInCount))" }
+        if ($user.FailedSignInCount -gt 0) { $indicators += "🚫 Failed Logins ($($user.FailedSignInCount))" }
+        if ($user.HighRiskOperationsCount -gt 0) { $indicators += "⚡ High-Risk Ops ($($user.HighRiskOperationsCount))" }
+        if ($user.SuspiciousRulesCount -gt 0) { $indicators += "📨 Suspicious Rules ($($user.SuspiciousRulesCount))" }
+        if ($user.FailedLoginPatternCount -gt 0) { $indicators += "🚨 Attack Patterns ($($user.FailedLoginPatternCount))" }
+        if ($user.PasswordChangeIssuesCount -gt 0) { $indicators += "🔑 PW Changes ($($user.PasswordChangeIssuesCount))" }
+		if ($user.HighRiskISPCount -gt 0) { $indicators += "⚠️ High-Risk ISPs ($($user.HighRiskISPCount))" }
+        
+        $indicatorText = if ($indicators.Count -gt 0) { $indicators -join "<br>" } else { "None" }
+        
+        $html += @"
+                        <tr class="summary-row-$riskClass">
+                            <td><strong>$([System.Web.HttpUtility]::HtmlEncode($user.UserDisplayName))</strong></td>
+                            <td>$([System.Web.HttpUtility]::HtmlEncode($user.UserId))</td>
+                            <td><span class="badge $riskClass">$($user.RiskLevel)</span></td>
+                            <td><strong>$($user.RiskScore)</strong></td>
+                            <td><span class="badge $mfaBadgeClass">$mfaStatus</span></td>
+                            <td style="font-size: 0.85em;">$indicatorText</td>
+                        </tr>
+"@
+    }
+
+    $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
         <div class="users-section">
             <h2 class="section-title">📊 Detailed User Risk Analysis</h2>
 "@
@@ -7877,41 +8034,114 @@ function Generate-HTMLReport {
         if ($user.PasswordChangeIssuesCount -gt 0) {
             $html += "<tr><td>Password Change Issues</td><td><span class='badge warning'>$($user.PasswordChangeIssuesCount)</span></td></tr>"
         }
+		if ($user.HighRiskISPCount -gt 0) {
+			$html += "<tr><td>High-Risk ISP Sign-Ins</td><td><span class='badge danger'>$($user.HighRiskISPCount)</span></td></tr>"
+		}
         
         $html += @"
                         </table>
                     </div>
 "@
 
-        # Unusual Sign-Ins Details
-        if ($user.UnusualSignIns -and $user.UnusualSignIns.Count -gt 0) {
-            $html += @"
+		# Unusual Sign-Ins Details
+		if ($user.UnusualSignIns -and $user.UnusualSignIns.Count -gt 0) {
+			$html += @"
+							<div class="evidence-section">
+								<h4>🌍 Unusual Sign-In Locations</h4>
+								<table>
+									<tr>
+										<th>Date/Time</th>
+										<th>Location</th>
+										<th>IP Address</th>
+										<th>ISP</th>
+										<th>Risk</th>
+									</tr>
+"@
+		foreach ($signIn in ($user.UnusualSignIns | Select-Object -First 10)) {
+			$location = "$($signIn.City), $($signIn.Country)"
+			
+			# Check if this ISP is high-risk
+			$isHighRiskISP = $false
+			if ($signIn.PSObject.Properties['IsHighRiskISP']) {
+				$isHighRiskISP = $signIn.IsHighRiskISP -eq $true -or $signIn.IsHighRiskISP -eq "True"
+			}
+			
+			$riskBadge = if ($isHighRiskISP) {
+				"<span class='badge danger' title='VPN/Hosting/Datacenter Provider'>⚠️ HIGH-RISK ISP</span>"
+			} else {
+				"<span class='badge info'>Standard</span>"
+			}
+			
+			# Highlight row if high-risk ISP
+			$rowClass = if ($isHighRiskISP) { " class='high-risk-row'" } else { "" }
+			
+			$html += @"
+                            <tr$rowClass>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.CreationTime))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($location))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.IP))</td>
+                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.ISP))</td>
+                                <td>$riskBadge</td>
+                            </tr>
+"@
+    }
+    $html += @"
+                        </table>
+                    </div>
+"@
+}
+
+
+# High-Risk ISP Sign-Ins Section
+if ($user.HighRiskISPSignIns -and $user.HighRiskISPSignIns.Count -gt 0) {
+    $html += @"
                     <div class="evidence-section">
-                        <h4>🌍 Unusual Sign-In Locations</h4>
+                        <h4 class="high-risk-title">⚠️ High-Risk ISP Connections (VPN/Hosting/Datacenter)</h4>
+                        <div class="alert warning">
+                            <strong>Security Alert:</strong> These sign-ins originated from ISPs commonly associated with VPS hosting, 
+                            VPN services, or datacenter infrastructure. While not always malicious, these connections warrant investigation 
+                            as they may indicate compromised credentials or unauthorized access.
+                        </div>
                         <table>
                             <tr>
                                 <th>Date/Time</th>
                                 <th>Location</th>
                                 <th>IP Address</th>
-                                <th>ISP</th>
+                                <th>High-Risk ISP</th>
+                                <th>Device</th>
                             </tr>
 "@
-            foreach ($signIn in ($user.UnusualSignIns | Select-Object -First 10)) {
-                $location = "$($signIn.City), $($signIn.Country)"
-                $html += @"
-                            <tr>
+    foreach ($signIn in ($user.HighRiskISPSignIns | Select-Object -First 10)) {
+        $location = "$($signIn.City), $($signIn.Country)"
+        $device = if ($signIn.UserAgent) {
+            [System.Web.HttpUtility]::HtmlEncode($signIn.UserAgent)
+        } else {
+            "Unknown"
+        }
+        
+        $html += @"
+                            <tr class="high-risk-row">
                                 <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.CreationTime))</td>
-                                <td>$([System.Web.HttpUtility]::HtmlEncode($location))</td>
-                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.IP))</td>
-                                <td>$([System.Web.HttpUtility]::HtmlEncode($signIn.ISP))</td>
+                                <td><span class="badge warning">$([System.Web.HttpUtility]::HtmlEncode($location))</span></td>
+                                <td><strong>$([System.Web.HttpUtility]::HtmlEncode($signIn.IP))</strong></td>
+                                <td><span class="badge danger">$([System.Web.HttpUtility]::HtmlEncode($signIn.ISP))</span></td>
+                                <td style="font-size: 0.85em;">$device</td>
                             </tr>
 "@
-            }
-            $html += @"
+    }
+    $html += @"
                         </table>
+                        <div class="recommendation-box">
+                            <strong>📋 Recommended Actions:</strong><br>
+                            • Verify these sign-ins with the user<br>
+                            • Confirm if VPN or remote access was authorized<br>
+                            • Review for unauthorized access patterns<br>
+                            • Consider enforcing Conditional Access policies for datacenter IPs<br>
+                            • Enable MFA if not already active
+                        </div>
                     </div>
 "@
-        }
+}
 
         # Failed Login Patterns
         if ($user.FailedLoginPatterns -and $user.FailedLoginPatterns.Count -gt 0) {
