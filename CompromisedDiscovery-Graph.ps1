@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "9.7"
+$ScriptVer = "9.9"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -1941,6 +1941,7 @@ function Connect-TenantServices {
         "Microsoft.Graph.Authentication",           # Core authentication
         "Microsoft.Graph.Users",                    # User operations
         "Microsoft.Graph.Reports",                  # Sign-in logs
+		 "Microsoft.Graph.Beta.Reports",              # BETA - for complete data
         "Microsoft.Graph.Identity.DirectoryManagement",  # Directory operations
         "Microsoft.Graph.Applications"              # App registrations
     )
@@ -3108,7 +3109,7 @@ function Get-TenantSignInData {
     #═══════════════════════════════════════════════════════════════════════════
     
     try {
-        Import-Module Microsoft.Graph.Reports -Force -ErrorAction Stop
+        Import-Module Microsoft.Graph.Beta.Reports -Force -ErrorAction Stop
         Write-Log "Microsoft.Graph.Reports module imported successfully" -Level "Info"
     }
     catch {
@@ -3147,7 +3148,7 @@ function Get-TenantSignInData {
             $filter = "createdDateTime ge $filterDate"
             Write-Log "Trying premium Graph API with filter: $filter" -Level "Info"
             
-            $signInLogs = Get-MgAuditLogSignIn -Filter $filter -All -ErrorAction Stop
+            $signInLogs = Get-MgBetaAuditLogSignIn -Filter $filter -All -ErrorAction Stop
             Write-Log "Premium Graph API successful: $($signInLogs.Count) total records" -Level "Info"
             Update-GuiStatus "Premium Graph API successful - $($signInLogs.Count) records retrieved" ([System.Drawing.Color]::Green)
         }
@@ -3757,15 +3758,65 @@ function Get-SignInDataFromExchangeOnline {
                     "Unknown"
                 }
                 
-                $statusCode = "0"
-                $statusDescription = "Success"
-                
-                if ($auditDetails.ResultStatus) {
-                    if ($auditDetails.ResultStatus -match "Failed|Failure|Error") {
-                        $statusCode = "50126"
-                        $statusDescription = "Failed - " + $auditDetails.ResultStatus
-                    }
-                }
+				# Default to success
+				$statusCode = "0"
+				$statusDescription = "Success"
+
+				# Check for ErrorCode property (modern Entra ID sign-in logs - added Feb 2021)
+				if ($auditDetails.ErrorCode) {
+					$statusCode = $auditDetails.ErrorCode.ToString()
+					$statusDescription = Get-SignInStatusDescription -StatusCode $statusCode
+				}
+				# Check for LogonError property (legacy field that indicates failure)
+				elseif ($auditDetails.LogonError) {
+					# LogonError present means it's a failed sign-in
+					# Try to extract error code from LogonError text
+					if ($auditDetails.LogonError -match '(\d{5,6})') {
+						$statusCode = $matches[1]
+					} else {
+						$statusCode = "50126"  # Default to invalid credentials
+					}
+					$statusDescription = "Failed - " + $auditDetails.LogonError
+				}
+				# Check Operation type - UserLoginFailed explicitly indicates failure
+				elseif ($operation -eq "UserLoginFailed") {
+					# Check ExtendedProperties for error code
+					if ($auditDetails.ExtendedProperties) {
+						$errorCodeProp = $auditDetails.ExtendedProperties | Where-Object { 
+							$_.Name -eq "ResultStatusDetail" -or $_.Name -eq "errorCode" 
+						}
+						if ($errorCodeProp -and $errorCodeProp.Value -match '(\d{5,6})') {
+							$statusCode = $matches[1]
+						} else {
+							$statusCode = "50126"
+						}
+					} else {
+						$statusCode = "50126"
+					}
+					$statusDescription = Get-SignInStatusDescription -StatusCode $statusCode
+				}
+				# Check ResultStatus for explicit failure indicators
+				elseif ($auditDetails.ResultStatus -and 
+						$auditDetails.ResultStatus -match "Failed|Failure|Error") {
+					# Try to extract error code from ResultStatus
+					if ($auditDetails.ResultStatus -match '(\d{5,6})') {
+						$statusCode = $matches[1]
+					} else {
+						$statusCode = "50126"
+					}
+					$statusDescription = "Failed - " + $auditDetails.ResultStatus
+				}
+				# If Operation is UserLoggedIn but ResultStatus shows failure
+				elseif ($operation -eq "UserLoggedIn" -and 
+						$auditDetails.ResultStatus -eq "Failed") {
+					if ($auditDetails.ResultStatus -match '(\d{5,6})') {
+						$statusCode = $matches[1]
+					} else {
+						$statusCode = "50126"
+					}
+					$statusDescription = Get-SignInStatusDescription -StatusCode $statusCode
+				}
+
                 
                 $userAgent = if ($auditDetails.UserAgent) {
                     $auditDetails.UserAgent
@@ -3913,7 +3964,7 @@ function Get-MFAStatusFromSignIns {
         $startDate = (Get-Date).AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
         
         $filter = "userPrincipalName eq '$UserPrincipalName' and createdDateTime ge $startDate"
-        $signIns = Get-MgAuditLogSignIn -Filter $filter -Top 100 -ErrorAction SilentlyContinue
+        $signIns = Get-MgBetaAuditLogSignIn -Filter $filter -Top 100 -ErrorAction SilentlyContinue
         
         if (-not $signIns -or $signIns.Count -eq 0) {
             return @{
