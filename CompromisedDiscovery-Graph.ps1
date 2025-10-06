@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "10.1"
+$ScriptVer = "10.2"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -3811,7 +3811,23 @@ function Get-SignInDataFromExchangeOnline {
 					if ($auditDetails.LogonError -match '(\d{5,6})') {
 						$statusCode = $matches[1]
 					} else {
-						$statusCode = "50126"  # Default to invalid credentials
+						# Try to extract from other common patterns
+						if ($auditDetails.LogonError -match 'error\s*[:\s]*(\d{5,6})') {
+							$statusCode = $matches[1]
+						} elseif ($auditDetails.LogonError -match 'code\s*[:\s]*(\d{5,6})') {
+							$statusCode = $matches[1]
+						} else {
+							# Look for specific error descriptions to map to codes
+							switch -Wildcard ($auditDetails.LogonError) {
+								"*password*expired*" { $statusCode = "50133" }
+								"*account*disabled*" { $statusCode = "50057" }
+								"*account*locked*" { $statusCode = "50053" }
+								"*password*reset*" { $statusCode = "50125" }
+								"*mfa*required*" { $statusCode = "50074" }
+								"*consent*required*" { $statusCode = "65001" }
+								default { $statusCode = "50126" }  # Only default if nothing else matches
+							}
+						}
 					}
 					$statusDescription = "Failed - " + $auditDetails.LogonError
 				}
@@ -3820,12 +3836,28 @@ function Get-SignInDataFromExchangeOnline {
 					# Check ExtendedProperties for error code
 					if ($auditDetails.ExtendedProperties) {
 						$errorCodeProp = $auditDetails.ExtendedProperties | Where-Object { 
-							$_.Name -eq "ResultStatusDetail" -or $_.Name -eq "errorCode" 
+							$_.Name -eq "ResultStatusDetail" -or $_.Name -eq "errorCode" -or $_.Name -eq "ErrorCode"
 						}
 						if ($errorCodeProp -and $errorCodeProp.Value -match '(\d{5,6})') {
 							$statusCode = $matches[1]
 						} else {
-							$statusCode = "50126"
+							# Check for error description in other properties
+							$errorDescProp = $auditDetails.ExtendedProperties | Where-Object { 
+								$_.Name -eq "ResultDescription" -or $_.Name -eq "ErrorDescription"
+							}
+							if ($errorDescProp) {
+								switch -Wildcard ($errorDescProp.Value) {
+									"*password*expired*" { $statusCode = "50133" }
+									"*account*disabled*" { $statusCode = "50057" }
+									"*account*locked*" { $statusCode = "50053" }
+									"*password*reset*" { $statusCode = "50125" }
+									"*mfa*required*" { $statusCode = "50074" }
+									"*consent*required*" { $statusCode = "65001" }
+									default { $statusCode = "50126" }
+								}
+							} else {
+								$statusCode = "50126"
+							}
 						}
 					} else {
 						$statusCode = "50126"
