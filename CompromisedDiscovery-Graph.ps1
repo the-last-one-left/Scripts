@@ -64,7 +64,7 @@
 #──────────────────────────────────────────────────────────────
 # Update this version number when making significant changes
 # Format: Major.Minor (e.g., 8.2)
-$ScriptVer = "10.0"
+$ScriptVer = "10.1"
 
 #──────────────────────────────────────────────────────────────
 # GLOBAL CONNECTION STATE
@@ -3364,11 +3364,11 @@ function Get-TenantSignInData {
                 
                 # Get geolocation data from cache if not private
                 if (-not $isPrivateIP -and $ipCache.ContainsKey($ip)) {
-                    $geoData = $ipCache[$ip]
+                    $geoData = $ipCache[$ip].Data
                     $city = if ($geoData.city) { $geoData.city } else { "Unknown" }
                     $region = if ($geoData.region_name) { $geoData.region_name } else { "Unknown" }
                     $country = if ($geoData.country_name) { $geoData.country_name } else { "Unknown" }
-                    $isp = if ($geoData.isp) { $geoData.isp } else { "Unknown" }
+                    $isp = if ($geoData.connection -and $geoData.connection.isp) { $geoData.connection.isp } else { "Unknown" }
                     
                     # Check if location is unusual
                     if ($country -ne "Unknown" -and $ConfigData.ExpectedCountries -notcontains $country) {
@@ -3756,7 +3756,11 @@ function Get-SignInDataFromExchangeOnline {
                 if ([string]::IsNullOrEmpty($log.AuditData)) { continue }
                 
                 $auditDetails = $log.AuditData | ConvertFrom-Json -ErrorAction Stop
-                
+                # DEBUG: Dump first failed record
+				if ($signInResults.Count -eq 0 -and ($auditDetails.ResultStatus -match "Failed" -or $auditDetails.Operation -eq "UserLoginFailed")) {
+					$auditDetails | ConvertTo-Json -Depth 5 | Out-File "$env:TEMP\FirstFailedSignIn.json"
+					Write-Host "DEBUG: Saved first failed record to $env:TEMP\FirstFailedSignIn.json" -ForegroundColor Yellow
+				}
                 $creationTime = if ($auditDetails.CreationTime) { 
                     $auditDetails.CreationTime 
                 } elseif ($log.CreationDate) { 
