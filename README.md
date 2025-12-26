@@ -8,7 +8,7 @@ This repository has been consolidated into the **Yeyland Wutani** project.
 
 All scripts and tools are now maintained at:
 
-**[Yeyland Wutani](https://github.com/psychosmosis/YeylandWutani)**
+**[Yeyland Wutani](https://github.com/the-last-one-left/YeylandWutani)**
 
 ---
 
